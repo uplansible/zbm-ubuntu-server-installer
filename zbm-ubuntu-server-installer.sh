@@ -710,7 +710,7 @@ if [[ "$MODE" == "initial" ]]; then
     # Create single monolithic root dataset
     zfs create -o canmount=noauto -o mountpoint=/ rpool/ROOT
     zfs create -o mountpoint=/ rpool/ROOT/ubuntu-1
-    
+
     # Mount root
     zpool export rpool
     zpool import -N -R /mnt rpool
@@ -1160,6 +1160,9 @@ EOF
     echo ""
     echo "Step 16: Unmounting and exporting pool..."
 
+    # Kill any processes still using /mnt to prevent busy-mount failures
+    fuser -km /mnt 2>/dev/null || true
+
     # Prevent unmount propagation back to live host
     mount --make-rslave /mnt/dev  2>/dev/null || true
     mount --make-rslave /mnt/proc 2>/dev/null || true
@@ -1177,14 +1180,15 @@ EOF
         umount /mnt 2>/dev/null || true
     fi
 
-    # Lazy unmounts defer the actual unmount — explicitly release ZFS datasets
-    # before exporting, then sync to flush any pending I/O
+    # Explicitly release ZFS datasets before exporting, then sync to flush I/O
     zfs unmount -a 2>/dev/null || true
     sync
 
     if ! zpool export rpool 2>/dev/null; then
         echo "  Note: Normal export failed, retrying with force flag..."
-        zpool export -f rpool
+        if ! zpool export -f rpool 2>/dev/null; then
+            echo "  Warning: Pool export failed — pool will be recovered on next import."
+        fi
     fi
 
     echo ""
@@ -1222,8 +1226,8 @@ elif [[ "$MODE" == "postreboot" ]]; then
         exit 1
     fi
 
-    # Load persisted installation config from initial phase
-    INSTALL_CONF="/home/$USERNAME/zbm-installer/zbm-installer.conf"
+    # Load persisted installation config from initial phase (co-located with this script)
+    INSTALL_CONF="$(dirname "$0")/zbm-installer.conf"
     if [[ -f "$INSTALL_CONF" ]]; then
         # shellcheck source=/dev/null
         source "$INSTALL_CONF"
@@ -1406,14 +1410,15 @@ EOF
         ubuntu-server \
         pv \
         mbuffer \
-        ncdu
+        ncdu \
+        zfs-zed
 
     echo ""
     echo "Step 6a: Enabling system services..."
     echo "  - Enabling systemd-timesyncd for NTP..."
     systemctl enable --now systemd-timesyncd
     echo "  - Enabling zfs-zed for pool event monitoring..."
-    systemctl enable zfs-zed
+    systemctl enable --now zfs-zed
 
     echo ""
     echo "Step 6b: Installing Zellij terminal multiplexer..."
