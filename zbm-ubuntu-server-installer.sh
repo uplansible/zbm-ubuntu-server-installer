@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.17
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.18
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -399,6 +399,21 @@ validate_disk_size() {
 # INTERACTIVE DISK AND SIZE SELECTION
 ################################################################################
 
+# Resolve a partition block device to its stable /dev/disk/by-id/ path.
+# Skips wwn- prefixes (prefer ata-/nvme- for readability).
+# Falls back to the raw device path if no by-id symlink is found.
+resolve_part_byid() {
+    local part
+    part=$(readlink -f "$1")
+    local byid
+    byid=$(find /dev/disk/by-id/ -maxdepth 1 -type l 2>/dev/null \
+        | while read -r link; do
+            [[ "$(readlink -f "$link")" == "$part" ]] && echo "$link"
+          done \
+        | grep -v "/wwn-" | sort | head -1)
+    echo "${byid:-$1}"
+}
+
 # Present a numbered list of block devices and let the user choose one.
 # Sets the global DISK variable (e.g., /dev/sda).
 select_disk() {
@@ -411,14 +426,21 @@ select_disk() {
     local -a names sizes models
     local i=0
     while IFS= read -r line; do
-        local name size model
+        local name size model byid
         name=$(echo "$line" | awk '{print $1}')
         size=$(echo "$line" | awk '{print $2}')
         model=$(echo "$line" | awk '{$1=$2=""; print $0}' | sed 's/^ *//')
+        byid=$(find /dev/disk/by-id/ -maxdepth 1 -type l 2>/dev/null \
+            | while read -r link; do
+                [[ "$(readlink -f "$link")" == "/dev/$name" ]] && echo "$link"
+              done \
+            | grep -v "/wwn-" | sort | head -1)
+        byid="${byid##*/}"
         names+=("$name")
         sizes+=("$size")
         models+=("$model")
-        printf "  [%d] /dev/%-12s  %-8s  %s\n" "$((i + 1))" "$name" "$size" "$model"
+        printf "  [%d] /dev/%-10s  %-8s  %-28s  %s\n" \
+            "$((i + 1))" "$name" "$size" "$model" "${byid:--}"
         i=$(( i + 1 ))
     done < <(lsblk -d -o NAME,SIZE,MODEL --noheadings | grep -v '^loop\|^sr')
 
@@ -852,6 +874,15 @@ if [[ "$MODE" == "initial" ]]; then
     done
     echo "All partitions created successfully."
 
+    # Resolve stable by-id paths for ZFS pool creation
+    echo "Resolving partition by-id paths..."
+    DISK_RPOOL_ID=$(resolve_part_byid "$DISK_RPOOL")
+    echo "  rpool:    $DISK_RPOOL_ID"
+    if [[ -n "$DATAPOOL_NAME" ]]; then
+        DISK_DATAPOOL_ID=$(resolve_part_byid "$DISK_DATAPOOL")
+        echo "  datapool: $DISK_DATAPOOL_ID"
+    fi
+
     # Wipe any existing filesystem signatures and ZFS labels
     echo "Clearing filesystem signatures..."
     wipefs -a "$DISK_EFI" 2>/dev/null || true
@@ -893,7 +924,7 @@ if [[ "$MODE" == "initial" ]]; then
         -O relatime=$ZFS_RELATIME \
         -O xattr=sa \
         -O mountpoint=none \
-        rpool "$DISK_RPOOL"
+        rpool "$DISK_RPOOL_ID"
 
     # Create single monolithic root dataset
     zfs create -o canmount=noauto -o mountpoint=/ rpool/ROOT
@@ -1356,6 +1387,8 @@ EOF
     cat > "$INSTALL_DIR/zbm-installer.conf" <<EOF
 DISK="$DISK"
 PART_PREFIX="$PART_PREFIX"
+DISK_RPOOL_ID="$DISK_RPOOL_ID"
+DISK_DATAPOOL_ID="$DISK_DATAPOOL_ID"
 DATAPOOL_NAME="$DATAPOOL_NAME"
 DATAPOOL_MOUNTPOINT="$DATAPOOL_MOUNTPOINT"
 KEYBOARD_LAYOUT="$KEYBOARD_LAYOUT"
@@ -1744,7 +1777,12 @@ DOCKEREOF
             lsblk "$DISK" || true
             exit 1
         fi
-        echo "  - Using partition: $DATAPOOL_PARTITION"
+
+        # Use persisted by-id path from initial install, or resolve fresh, or fall back to raw
+        if [[ -z "${DISK_DATAPOOL_ID:-}" ]]; then
+            DISK_DATAPOOL_ID=$(resolve_part_byid "$DATAPOOL_PARTITION")
+        fi
+        echo "  - Using partition: $DISK_DATAPOOL_ID"
 
         # Create mount point
         echo "  - Creating mount point: $DATAPOOL_MOUNTPOINT"
@@ -1756,7 +1794,7 @@ DOCKEREOF
                      -O compression=${COMPRESSION} \
                      -O atime=$ZFS_ATIME \
                      -O mountpoint="$DATAPOOL_MOUNTPOINT" \
-                     "$DATAPOOL_NAME" "$DATAPOOL_PARTITION"
+                     "$DATAPOOL_NAME" "$DISK_DATAPOOL_ID"
 
         echo "  ✓ Datapool '$DATAPOOL_NAME' created and mounted at $DATAPOOL_MOUNTPOINT"
 
@@ -1800,8 +1838,8 @@ EOF
         echo "     zfs create $DATAPOOL_NAME/services"
     else
         echo "  2. Create your datapool manually when ready:"
-        echo "     First, identify your datapool partition with: lsblk"
-        echo "     Then: zpool create -o ashift=12 -O compression=lz4 datapool /dev/PARTITION"
+        echo "     First, identify your datapool partition with: ls /dev/disk/by-id/ | grep part4"
+        echo "     Then: zpool create -o ashift=12 -O compression=lz4 datapool /dev/disk/by-id/PARTITION-ID"
         echo "  3. Create datasets in datapool as needed:"
         echo "     zfs create datapool/docker"
         echo "     zfs create datapool/services"
