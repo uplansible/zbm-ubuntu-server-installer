@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.12
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.13
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -43,6 +43,76 @@ APT_MIRROR="https://archive.ubuntu.com/ubuntu"
 # Optional datapool configuration (set to empty string to skip)
 DATAPOOL_NAME="ssdupl"                 # Name of the datapool (leave empty to skip auto-creation)
 DATAPOOL_MOUNTPOINT="/mnt/ssdupl"      # Where to mount the datapool
+
+################################################################################
+# LOCALE SEARCH
+################################################################################
+# Searches /usr/share/i18n/SUPPORTED for locales matching a user-supplied term.
+# Sets the global LOCALE variable. Press Enter with no search term to keep default.
+select_locale() {
+    local supported_file="/usr/share/i18n/SUPPORTED"
+    if [[ ! -f "$supported_file" ]]; then
+        echo "Note: $supported_file not found, keeping locale: $LOCALE"
+        return
+    fi
+
+    echo "Locale search — current default: $LOCALE"
+    echo "Type a search term (e.g. 'de', 'ch', 'en_US') or press Enter to keep default."
+
+    while true; do
+        echo ""
+        local term
+        read -rp "Search locale (Enter to accept [$LOCALE]): " term
+
+        # Empty input = keep current LOCALE
+        if [[ -z "$term" ]]; then
+            echo "  Keeping locale: $LOCALE"
+            return
+        fi
+
+        # Search: extract first field (locale name), filter by term (case-insensitive)
+        local -a results
+        mapfile -t results < <(grep -i "$term" "$supported_file" | awk '{print $1}' | grep -v '^#')
+
+        if [[ ${#results[@]} -eq 0 ]]; then
+            echo "  No locales found matching '$term'. Try again."
+            continue
+        fi
+
+        # Show up to 30 results to avoid flooding the terminal
+        local display_count=${#results[@]}
+        local truncated=false
+        if [[ $display_count -gt 30 ]]; then
+            display_count=30
+            truncated=true
+        fi
+
+        echo ""
+        for (( i=0; i<display_count; i++ )); do
+            printf "  [%2d] %s\n" "$((i+1))" "${results[$i]}"
+        done
+        if $truncated; then
+            echo "  ... (${#results[@]} total — refine your search to see more)"
+        fi
+
+        echo ""
+        local choice
+        read -rp "Select number, or press Enter to search again: " choice
+
+        if [[ -z "$choice" ]]; then
+            continue
+        fi
+
+        if [[ "$choice" =~ ^[0-9]+$ ]] && \
+           [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$display_count" ]]; then
+            LOCALE="${results[$((choice-1))]}"
+            echo "  Locale set to: $LOCALE"
+            return
+        fi
+
+        echo "  Invalid selection. Press Enter to search again."
+    done
+}
 
 ################################################################################
 # INTERACTIVE CONFIGURATION
@@ -103,6 +173,10 @@ configure_interactively() {
     if [[ -n "$input" ]]; then
         SWAP_SIZE="$input"
     fi
+
+    # Locale (interactive search)
+    echo ""
+    select_locale
 
     # ZFS compression
     echo ""
@@ -170,6 +244,7 @@ configure_interactively() {
     echo "  Username:     $USERNAME"
     echo "  Password:     (set)"
     echo "  Timezone:     $TIMEZONE"
+    echo "  Locale:       $LOCALE"
     echo "  Swap size:    $SWAP_SIZE"
     echo "  Compression:  $COMPRESSION"
     local kbd_summary="$KEYBOARD_LAYOUT"

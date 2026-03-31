@@ -29,43 +29,35 @@ Automated installation script for Ubuntu 24.04 Server with ZFS root filesystem a
 1. **Boot Ubuntu 24.04 Live USB**
 
 2. **Download and run:**
+
+   > **Review before running:** This script will **permanently destroy all data** on the target disk. It is good practice to read the script before executing it: [zbm-ubuntu-server-installer.sh](https://github.com/uplansible/zbm-ubuntu-server-installer/blob/main/zbm-ubuntu-server-installer.sh)
+
+   To download the script and execute it, use the convenient one-liner:
    ```bash
    wget -qO zbm-ubuntu-server-installer.sh https://raw.githubusercontent.com/uplansible/zbm-ubuntu-server-installer/main/zbm-ubuntu-server-installer.sh && chmod +x zbm-ubuntu-server-installer.sh && sudo ./zbm-ubuntu-server-installer.sh initial
    ```
 
-   > **Optional:** If you need to change `LOCALE` (default: `en_GB.UTF-8`), `EFI_SIZE`, `RPOOL_PERCENT`, or `DATAPOOL_MOUNTPOINT`, download the script first and edit those at the top before running:
-   > ```bash
-   > wget -qO zbm-ubuntu-server-installer.sh https://raw.githubusercontent.com/uplansible/zbm-ubuntu-server-installer/main/zbm-ubuntu-server-installer.sh
-   > nano zbm-ubuntu-server-installer.sh
-   > chmod +x zbm-ubuntu-server-installer.sh && sudo ./zbm-ubuntu-server-installer.sh initial
-   > ```
-
-   The script will interactively prompt for:
+   All configuration is collected interactively — no script editing required. You will be prompted for:
    - **Disk** — select from detected disks
-   - **Hostname**, **Username**, **Password** — your system identity
+   - **Hostname**, **Username**, **Password**
    - **Timezone** — e.g. `Europe/Zurich`
+   - **Locale** — e.g. `en_GB.UTF-8`
    - **Swap size** — auto-suggested based on detected RAM
    - **ZFS compression** — lz4 / zstd / gzip / none
    - **Keyboard layout** — auto-detected from live session, confirm or override
    - **Datapool** — optional second pool for user data
 
-   Type `YES` to confirm the disk layout. Wait 15-30 minutes.
+   Type `YES` to confirm the disk layout. Wait 15–30 minutes.
 
-5. **Reboot and complete setup:**
+3. **Reboot and complete setup:**
    ```bash
-   # After first boot, login and run:
-   sudo /root/zbm-ubuntu-server-installer.sh postreboot
+   sudo ~/zbm-installer/zbm-ubuntu-server-installer.sh postreboot
    ```
-
-   Your password was set during installation. The root account is locked for security.
 
 ## 📖 Documentation
 
 - **[INSTALLATION-GUIDE.md](INSTALLATION-GUIDE.md)** - Complete step-by-step installation guide
 - **[QUICK-REFERENCE.md](QUICK-REFERENCE.md)** - Common ZFS/Sanoid/Syncoid commands
-- **[CHANGELOG.md](CHANGELOG.md)** - Detailed version history and changelog
-- **[TEST-VALIDATION.md](TEST-VALIDATION.md)** - Testing checklist and validation procedures
-- **[CLAUDE.md](CLAUDE.md)** - Developer guidance for working with this codebase
 
 ## 🏗️ Architecture
 
