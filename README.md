@@ -28,23 +28,17 @@ Automated installation script for Ubuntu 24.04 Server with ZFS root filesystem a
 
 1. **Boot Ubuntu 24.04 Live USB**
 
-2. **Download the script:**
+2. **Download and run:**
    ```bash
-   wget https://raw.githubusercontent.com/uplansible/zbm-ubuntu-server-installer/main/zbm-ubuntu-server-installer.sh
-   chmod +x zbm-ubuntu-server-installer.sh
+   wget -qO zbm-ubuntu-server-installer.sh https://raw.githubusercontent.com/uplansible/zbm-ubuntu-server-installer/main/zbm-ubuntu-server-installer.sh && chmod +x zbm-ubuntu-server-installer.sh && sudo ./zbm-ubuntu-server-installer.sh initial
    ```
 
-3. **(Optional) Edit locale or advanced settings:**
-
-   The script collects all configuration interactively — no file editing required for most setups. If you need to change `LOCALE` (default: `en_US.UTF-8`), `EFI_SIZE`, `RPOOL_PERCENT`, or `DATAPOOL_MOUNTPOINT`, edit those at the top of the script:
-   ```bash
-   nano zbm-ubuntu-server-installer.sh
-   ```
-
-4. **Run installation:**
-   ```bash
-   sudo ./zbm-ubuntu-server-installer.sh initial
-   ```
+   > **Optional:** If you need to change `LOCALE` (default: `en_GB.UTF-8`), `EFI_SIZE`, `RPOOL_PERCENT`, or `DATAPOOL_MOUNTPOINT`, download the script first and edit those at the top before running:
+   > ```bash
+   > wget -qO zbm-ubuntu-server-installer.sh https://raw.githubusercontent.com/uplansible/zbm-ubuntu-server-installer/main/zbm-ubuntu-server-installer.sh
+   > nano zbm-ubuntu-server-installer.sh
+   > chmod +x zbm-ubuntu-server-installer.sh && sudo ./zbm-ubuntu-server-installer.sh initial
+   > ```
 
    The script will interactively prompt for:
    - **Disk** — select from detected disks
@@ -52,6 +46,7 @@ Automated installation script for Ubuntu 24.04 Server with ZFS root filesystem a
    - **Timezone** — e.g. `Europe/Zurich`
    - **Swap size** — auto-suggested based on detected RAM
    - **ZFS compression** — lz4 / zstd / gzip / none
+   - **Keyboard layout** — auto-detected from live session, confirm or override
    - **Datapool** — optional second pool for user data
 
    Type `YES` to confirm the disk layout. Wait 15-30 minutes.
