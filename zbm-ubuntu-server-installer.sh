@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.20
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.21
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -605,8 +605,8 @@ show_disk_confirmation() {
 select_fastest_mirror() {
     local mirror_list_url="https://mirrors.ubuntu.com/mirrors.txt"
     local test_path="dists/noble/main/binary-amd64/Packages.gz"
-    local max_candidates=8
-    local curl_timeout=8
+    local max_candidates=6
+    local curl_timeout=5
     local fallback="https://archive.ubuntu.com/ubuntu"
 
     echo ""
@@ -615,10 +615,12 @@ select_fastest_mirror() {
     local -a candidates=()
 
     local raw_list
-    if raw_list=$(curl -s --max-time 10 "$mirror_list_url" 2>/dev/null) && [[ -n "$raw_list" ]]; then
+    # -L follows redirects; mirrors.ubuntu.com/mirrors.txt returns http:// URLs,
+    # so we accept both http:// and https://, and strip any trailing slash
+    if raw_list=$(curl -sL --max-time 10 "$mirror_list_url" 2>/dev/null) && [[ -n "$raw_list" ]]; then
         mapfile -t candidates < <(
             printf '%s\n' "$raw_list" \
-            | awk '/^https:\/\// { print $1 }' \
+            | awk '/^https?:\/\// { gsub(/\/$/, ""); print $1 }' \
             | awk '!seen[$0]++' \
             | head -n "$max_candidates"
         )
