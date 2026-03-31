@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.14
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.15
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -858,7 +858,6 @@ if [[ "$MODE" == "initial" ]]; then
 
     # Limit ZFS ARC on low-RAM systems to prevent OOM during debootstrap
     # ZFS ARC defaults to ~50% of RAM; on 2-4GB VMs this leaves too little for debootstrap
-    local total_ram_kb
     total_ram_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
     if [[ $total_ram_kb -le 4194304 ]]; then
         echo 536870912 > /sys/module/zfs/parameters/zfs_arc_max
