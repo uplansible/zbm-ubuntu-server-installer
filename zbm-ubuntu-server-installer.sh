@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.18
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.19
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -598,45 +598,80 @@ show_disk_confirmation() {
 ################################################################################
 # MIRROR SPEED SELECTION
 ################################################################################
-# Tests a set of candidate Ubuntu mirrors and sets APT_MIRROR to the fastest.
-# Falls back to the official archive if all tests fail.
+# Fetches the GeoIP-filtered mirror list from mirrors.ubuntu.com, then measures
+# actual download throughput (bytes/sec) for each candidate using curl+awk.
+# Falls back to a built-in list if the fetch fails, and to the official archive
+# if all throughput tests return zero. Uses awk for float comparison (no bc).
 select_fastest_mirror() {
-    local -a candidates=(
-        "https://archive.ubuntu.com/ubuntu"
-        "https://mirror.init7.net/ubuntu"
-        "https://ubuntu.mirror.liteserver.nl/ubuntu"
-        "https://ftp.halifax.rwth-aachen.de/ubuntu"
-        "https://mirror.de.leaseweb.net/ubuntu"
-        "https://mirrors.edge.kernel.org/ubuntu"
-    )
+    local mirror_list_url="https://mirrors.ubuntu.com/mirrors.txt"
+    local test_path="dists/noble/main/binary-amd64/Packages.gz"
+    local max_candidates=8
+    local curl_timeout=8
+    local fallback="https://archive.ubuntu.com/ubuntu"
 
     echo ""
-    echo "Testing Ubuntu mirrors for fastest response..."
+    echo "Fetching regional Ubuntu mirror list..."
+
+    local -a candidates=()
+
+    local raw_list
+    if raw_list=$(curl -s --max-time 10 "$mirror_list_url" 2>/dev/null) && [[ -n "$raw_list" ]]; then
+        mapfile -t candidates < <(
+            printf '%s\n' "$raw_list" \
+            | awk '/^https:\/\// { print $1 }' \
+            | awk '!seen[$0]++' \
+            | head -n "$max_candidates"
+        )
+        echo "  Retrieved ${#candidates[@]} regional mirrors"
+    else
+        echo "  Could not fetch mirror list, using built-in candidates."
+    fi
+
+    # Ensure the official fallback is always included
+    local already_present=0
+    for c in "${candidates[@]+"${candidates[@]}"}"; do
+        [[ "$c" == "$fallback" ]] && already_present=1 && break
+    done
+    (( already_present == 0 )) && candidates+=("$fallback")
+
+    # If the dynamic fetch produced nothing, add a minimal built-in set
+    if (( ${#candidates[@]} == 1 )); then
+        candidates+=(
+            "https://mirror.init7.net/ubuntu"
+            "https://ftp.halifax.rwth-aachen.de/ubuntu"
+            "https://mirrors.edge.kernel.org/ubuntu"
+        )
+    fi
+
+    echo "  Testing ${#candidates[@]} mirrors for download throughput..."
 
     local best_mirror=""
-    local best_time="999"
+    local best_speed="0"
 
     for mirror in "${candidates[@]}"; do
-        local elapsed
-        elapsed=$(curl -s --max-time 5 -o /dev/null \
-            -w "%{time_total}" \
-            "${mirror}/dists/noble/Release" 2>/dev/null || echo "999")
-        # Strip leading zeros for bc comparison
-        local elapsed_clean
-        elapsed_clean=$(echo "$elapsed" | sed 's/^0*//' | sed 's/^\./0./')
-        [[ -z "$elapsed_clean" ]] && elapsed_clean="999"
-        printf "  %-55s %ss\n" "$mirror" "$elapsed"
-        if (( $(echo "$elapsed_clean < $best_time" | bc -l 2>/dev/null || echo 0) )); then
-            best_time="$elapsed_clean"
+        local speed
+        speed=$(curl -s --max-time "$curl_timeout" -o /dev/null \
+            -w "%{speed_download}" \
+            "${mirror}/${test_path}" 2>/dev/null) || speed="0"
+        [[ -z "$speed" ]] && speed="0"
+
+        local speed_kb
+        speed_kb=$(awk -v s="$speed" 'BEGIN { printf "%.0f", s/1024 }')
+        printf "  %-55s %s KB/s\n" "$mirror" "$speed_kb"
+
+        if awk -v s="$speed" -v b="$best_speed" 'BEGIN { exit !(s > b) }'; then
+            best_speed="$speed"
             best_mirror="$mirror"
         fi
     done
 
-    if [[ -n "$best_mirror" ]] && [[ "$best_time" != "999" ]]; then
+    if [[ -n "$best_mirror" ]] && awk -v b="$best_speed" 'BEGIN { exit !(b > 0) }'; then
         APT_MIRROR="$best_mirror"
-        echo "  ✓ Selected mirror: $APT_MIRROR (${best_time}s)"
+        local best_kb
+        best_kb=$(awk -v s="$best_speed" 'BEGIN { printf "%.0f", s/1024 }')
+        echo "  ✓ Selected mirror: $APT_MIRROR (${best_kb} KB/s)"
     else
-        APT_MIRROR="https://archive.ubuntu.com/ubuntu"
+        APT_MIRROR="$fallback"
         echo "  ✓ All mirror tests failed, using fallback: $APT_MIRROR"
     fi
 }
