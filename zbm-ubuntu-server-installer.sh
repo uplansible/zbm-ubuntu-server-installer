@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.19
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.20
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -778,13 +778,15 @@ if [[ "$MODE" == "initial" ]]; then
     sed -i 's,#precedence ::ffff:0:0/96  100,precedence ::ffff:0:0/96  100,' /etc/gai.conf
     echo "  ✓ IPv4 preferred for apt (IPv6 workaround applied)"
 
-    # Select fastest apt mirror before any apt commands
-    select_fastest_mirror
-
     echo ""
     echo "Step 2: Installing prerequisites..."
     apt update
-    apt install -y debootstrap gdisk zfs-initramfs bc
+    # curl is included here so select_fastest_mirror (called next) can use it;
+    # the live ISO may not ship curl, and we need it for mirror speed testing
+    apt install -y curl debootstrap gdisk zfs-initramfs bc
+
+    # Select fastest apt mirror now that curl is guaranteed to be available
+    select_fastest_mirror
 
     # Interactively prompt for configuration values (after bc is installed for size validation)
     configure_interactively
