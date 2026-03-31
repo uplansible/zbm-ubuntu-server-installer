@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.13
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.14
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -707,6 +707,9 @@ if [[ "$MODE" == "initial" ]]; then
     sed -i 's,#precedence ::ffff:0:0/96  100,precedence ::ffff:0:0/96  100,' /etc/gai.conf
     echo "  ✓ IPv4 preferred for apt (IPv6 workaround applied)"
 
+    # Select fastest apt mirror before any apt commands
+    select_fastest_mirror
+
     echo ""
     echo "Step 2: Installing prerequisites..."
     apt update
@@ -714,9 +717,6 @@ if [[ "$MODE" == "initial" ]]; then
 
     # Interactively prompt for configuration values (after bc is installed for size validation)
     configure_interactively
-
-    # Select fastest apt mirror (after interactive config, before debootstrap)
-    select_fastest_mirror
 
     # Validate configuration inputs
     echo ""
@@ -851,6 +851,18 @@ if [[ "$MODE" == "initial" ]]; then
     zpool labelclear -f "$DISK_RPOOL" 2>/dev/null || true
     if [[ -n "$DATAPOOL_NAME" ]]; then
         zpool labelclear -f "$DISK_DATAPOOL" 2>/dev/null || true
+    fi
+
+    # Stop ZFS live-system services that conflict with manual pool creation on live ISOs
+    systemctl stop zed zfs-zed zfs-import-scan zfs-import-cache 2>/dev/null || true
+
+    # Limit ZFS ARC on low-RAM systems to prevent OOM during debootstrap
+    # ZFS ARC defaults to ~50% of RAM; on 2-4GB VMs this leaves too little for debootstrap
+    local total_ram_kb
+    total_ram_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    if [[ $total_ram_kb -le 4194304 ]]; then
+        echo 536870912 > /sys/module/zfs/parameters/zfs_arc_max
+        echo "  ZFS ARC capped at 512MB (<=4GB RAM detected)"
     fi
 
     echo ""
