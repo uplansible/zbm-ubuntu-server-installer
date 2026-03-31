@@ -46,7 +46,7 @@ Version is in the script header (line 5): `# Ubuntu Server 24.04 ZFSBootMenu Ins
 Increment patch on every push.
 
 ## Current Version
-v3.0.13
+v3.0.14
 
 ## Future Work (not yet implemented)
 - **Mirror / RAIDZ topologies**: Support multi-disk pools (mirror, raidz1, raidz2, raidz3).
