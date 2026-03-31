@@ -76,13 +76,15 @@ Automated installation script for Ubuntu 24.04 Server with ZFS root filesystem a
 Partition 1:  1GB         EFI System Partition
 Partition 2:  auto (RAM)  Swap
 Partition 3:  80% of disk rpool (ZFS root)
-Partition 4:  Rest        datapool (manual creation)
+Partition 4:  Rest        datapool (created automatically in postreboot if configured)
 ```
 
 **ZFS Structure:**
 ```
-rpool/ROOT/ubuntu-1    ← Monolithic dataset (root + /home)
-datapool/              ← Optional: for user data (you create later)
+rpool/ROOT/ubuntu-1        ← Monolithic dataset (root + /home)
+rpool/ROOT/ubuntu-1/var    ← /var (inherits compression)
+rpool/ROOT/ubuntu-1/var/log ← /var/log (compression disabled)
+datapool/                  ← Optional separate data pool (configured during install)
   ├── docker
   ├── services
   └── ...
@@ -233,7 +235,7 @@ reboot
 - ✅ **No Default Passwords** - Password set interactively during installation; root account is locked
 - ❌ **No Firewall** - SSH exposed without firewall
 - ❌ **No Encryption** - rpool is unencrypted (by design for simplicity)
-- ✅ **SSH Enabled** - For remote access
+- ✅ **SSH Enabled** - openssh-server installed and active after first boot
 
 ### Recommended Hardening
 ```bash
@@ -313,23 +315,13 @@ sudo zpool scrub rpool
 sudo sanoid --prune-snapshots --verbose
 ```
 
-## 🤝 Contributing
-
-Contributions welcome! Areas for improvement:
-- [ ] Random password generation
-- [ ] Static IP configuration prompts
-- [ ] Firewall setup
-- [ ] SSH key configuration
-- [ ] Optional rpool encryption
-- [ ] Support for other distributions
-
 ## 📝 License
 
 MIT License - See LICENSE file for details
 
 ## 🙏 Credits
 
-- Based on community ZFSBootMenu installation guides
+- Inspired by [ubuntu-server-zfsbootmenu](https://github.com/Sithuk/ubuntu-server-zfsbootmenu) by [Sithuk](https://github.com/Sithuk)
 - Uses [ZFSBootMenu](https://github.com/zbm-dev/zfsbootmenu) by zbm-dev
 - Uses [Sanoid](https://github.com/jimsalterjrs/sanoid) by Jim Salter
 - OpenZFS project

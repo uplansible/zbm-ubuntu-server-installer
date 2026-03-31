@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.11
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.12
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management

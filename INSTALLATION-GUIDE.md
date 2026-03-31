@@ -24,7 +24,7 @@ This script creates a **monolithic** ZFS root pool installation - perfect for tr
 /dev/nvme0n1p1  1GB    EFI System Partition
 /dev/nvme0n1p2  8GB    Swap
 /dev/nvme0n1p3  80GB   rpool (ZFS root)
-/dev/nvme0n1p4  ~1.9TB datapool (for manual creation later)
+/dev/nvme0n1p4  ~1.9TB datapool (created in postreboot if configured)
 ```
 
 **Disk Layout (SATA example):**
@@ -32,7 +32,7 @@ This script creates a **monolithic** ZFS root pool installation - perfect for tr
 /dev/sda1       1GB    EFI System Partition
 /dev/sda2       8GB    Swap
 /dev/sda3       80GB   rpool (ZFS root)
-/dev/sda4       ~1.9TB datapool (for manual creation later)
+/dev/sda4       ~1.9TB datapool (created in postreboot if configured)
 ```
 
 *Script automatically detects disk type and uses correct partition naming.*
@@ -152,52 +152,10 @@ rpool/ROOT/ubuntu-1    <- Everything (root + home) in ONE dataset
    sudo passwd root    # Change root password
    ```
 
-5. **Create datapool (when ready):**
-
-   First, identify your datapool partition:
+5. **Datapool** — if you chose to create a datapool during installation, the postreboot script created it automatically on partition 4 and added it to Sanoid. Verify with:
    ```bash
-   lsblk
-   ```
-
-   Look for partition 4 (the largest one). Then create the pool:
-   ```bash
-   # For NVMe disks:
-   # First, change partition type to ZFS (BF00)
-   sudo sgdisk -t4:BF00 /dev/nvme0n1
-
-   # Then create the pool
-   sudo zpool create -o ashift=12 \
-                     -O compression=lz4 \
-                     -O atime=off \
-                     -O relatime=on \
-                     datapool /dev/nvme0n1p4
-
-   # For SATA disks:
-   # First, change partition type to ZFS (BF00)
-   sudo sgdisk -t4:BF00 /dev/sda
-
-   # Then create the pool
-   sudo zpool create -o ashift=12 \
-                     -O compression=lz4 \
-                     -O atime=off \
-                     -O relatime=on \
-                     datapool /dev/sda4
-   
-   # Create datasets
-   sudo zfs create datapool/docker
-   sudo zfs create datapool/services
-   ```
-
-6. **Configure Sanoid for datapool:**
-   ```bash
-   sudo nano /etc/sanoid/sanoid.conf
-   ```
-
-   Add:
-   ```ini
-   [datapool/docker]
-       use_template = template_production
-       recursive = yes
+   zpool list
+   zfs list
    ```
 
 ## What's New in Version 3.0
@@ -407,10 +365,10 @@ Not recommended, but if you must:
 
 ## Resources
 
+- **Inspired by:** https://github.com/Sithuk/ubuntu-server-zfsbootmenu
 - **ZFSBootMenu:** https://github.com/zbm-dev/zfsbootmenu
 - **Sanoid:** https://github.com/jimsalterjrs/sanoid
 - **OpenZFS Docs:** https://openzfs.github.io/openzfs-docs/
-- **Ubuntu ZFS Guide:** https://ubuntu.com/tutorials/setup-zfs-storage-pool
 
 ## Support
 
