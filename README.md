@@ -279,6 +279,28 @@ ping -c 3 8.8.8.8
 - Verify EFI boot entry: `efibootmgr`
 - Verify ZFSBootMenu file exists: `ls /boot/efi/EFI/ZBM/`
 
+### Testing in a VM (virt-manager / QEMU)
+
+**Recommended firmware:** `OVMF_CODE_4M.fd` (4 MB NVRAM, no Secure Boot)
+
+In virt-manager → VM Details → Overview → Firmware, select:
+```
+UEFI x86_64: /usr/share/OVMF/OVMF_CODE_4M.fd
+```
+
+Avoid these variants — they will prevent ZFSBootMenu from booting (unsigned binary):
+- `OVMF_CODE_4M.ms.fd` / `OVMF_CODE_4M.md.fd` — Secure Boot with MS keys enrolled
+- `OVMF_CODE.secboot.fd` — Secure Boot enabled
+- `OVMF_CODE.amdsev.fd` — AMD SEV encryption (not relevant)
+
+**After installation, before rebooting:**
+- Detach the live ISO from the VM (Disk → right-click → Remove)
+- Verify the EFI binary is present: `ls /mnt/boot/efi/EFI/BOOT/BOOTX64.EFI`
+
+**If you see TianoCore logo → "no bootable device":**
+1. Confirm firmware is `OVMF_CODE_4M.fd` (not a secboot variant)
+2. Press F2 at the TianoCore screen → Boot Manager → Boot From File → select the disk → `EFI\BOOT\BOOTX64.EFI` to test manually
+
 ## 📊 Performance Tips
 
 ### For SSDs
