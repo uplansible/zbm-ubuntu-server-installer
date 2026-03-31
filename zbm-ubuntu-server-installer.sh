@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.16
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.17
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -43,6 +43,10 @@ APT_MIRROR="https://archive.ubuntu.com/ubuntu"
 # Optional datapool configuration (set to empty string to skip)
 DATAPOOL_NAME="ssdupl"                 # Name of the datapool (leave empty to skip auto-creation)
 DATAPOOL_MOUNTPOINT="/mnt/ssdupl"      # Where to mount the datapool
+
+# Optional software
+INSTALL_ZELLIJ="y"   # Install Zellij terminal multiplexer (y/n)
+INSTALL_DOCKER="y"   # Install Docker Engine via official apt repo (y/n)
 
 ################################################################################
 # LOCALE SEARCH
@@ -236,6 +240,14 @@ configure_interactively() {
         fi
     fi
 
+    # Software
+    echo ""
+    echo "--- Software ---"
+    read -rp "Install Zellij terminal multiplexer? [Y/n]: " input
+    if [[ "$input" =~ ^[Nn]$ ]]; then INSTALL_ZELLIJ="n"; else INSTALL_ZELLIJ="y"; fi
+    read -rp "Install Docker Engine (official apt repo, not snap)? [Y/n]: " input
+    if [[ "$input" =~ ^[Nn]$ ]]; then INSTALL_DOCKER="n"; else INSTALL_DOCKER="y"; fi
+
     # Summary
     echo ""
     echo "======================================================================"
@@ -251,6 +263,8 @@ configure_interactively() {
     [[ -n "$KEYBOARD_VARIANT" ]] && kbd_summary="$KEYBOARD_LAYOUT/$KEYBOARD_VARIANT"
     echo "  Keyboard:     $kbd_summary"
     echo "  Datapool:     ${DATAPOOL_NAME:-<none>}"
+    echo "  Zellij:       ${INSTALL_ZELLIJ}"
+    echo "  Docker:       ${INSTALL_DOCKER}"
     echo "======================================================================"
     echo ""
 }
@@ -1346,6 +1360,8 @@ DATAPOOL_NAME="$DATAPOOL_NAME"
 DATAPOOL_MOUNTPOINT="$DATAPOOL_MOUNTPOINT"
 KEYBOARD_LAYOUT="$KEYBOARD_LAYOUT"
 KEYBOARD_VARIANT="$KEYBOARD_VARIANT"
+INSTALL_ZELLIJ="$INSTALL_ZELLIJ"
+INSTALL_DOCKER="$INSTALL_DOCKER"
 EOF
     chmod 600 "$INSTALL_DIR/zbm-installer.conf"
     TARGET_UID=$(awk -F: -v user="$USERNAME" '$1==user {print $3}' /mnt/etc/passwd)
@@ -1622,48 +1638,89 @@ EOF
 
     echo ""
     echo "Step 6b: Installing Zellij terminal multiplexer..."
-    # Install Zellij from official release
-    ZELLIJ_VERSION=$(curl -s https://api.github.com/repos/zellij-org/zellij/releases/latest | grep -Po '"tag_name": "v\K[^"]*')
+    if [[ "${INSTALL_ZELLIJ:-y}" == "y" ]]; then
+        # Install Zellij from official release
+        ZELLIJ_VERSION=$(curl -s https://api.github.com/repos/zellij-org/zellij/releases/latest | grep -Po '"tag_name": "v\K[^"]*')
 
-    # Validate version format (should be X.Y.Z)
-    if [[ -z "$ZELLIJ_VERSION" ]] || [[ ! "$ZELLIJ_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "Warning: Could not fetch valid Zellij version (got: '$ZELLIJ_VERSION'), using v0.43.1 as fallback"
-        ZELLIJ_VERSION="0.43.1"
-    fi
-    echo "  - Installing Zellij version $ZELLIJ_VERSION"
-
-    # Detect architecture for Zellij download
-    ZELLIJ_ARCH=$(uname -m)
-    case "$ZELLIJ_ARCH" in
-        x86_64)  ZELLIJ_ARCH_SUFFIX="x86_64-unknown-linux-musl" ;;
-        aarch64) ZELLIJ_ARCH_SUFFIX="aarch64-unknown-linux-musl" ;;
-        *)
-            echo "  ⚠ Warning: Unsupported architecture '$ZELLIJ_ARCH', skipping Zellij installation"
-            ZELLIJ_SKIP=true ;;
-    esac
-
-    # Try to download Zellij, with error handling
-    if [[ "${ZELLIJ_SKIP:-false}" != "true" ]]; then
-        if ! curl -L "https://github.com/zellij-org/zellij/releases/download/v${ZELLIJ_VERSION}/zellij-${ZELLIJ_ARCH_SUFFIX}.tar.gz" -o /tmp/zellij.tar.gz; then
-            echo "  ⚠ Warning: Failed to download Zellij, skipping installation..."
-            ZELLIJ_SKIP=true
-        else
-            ZELLIJ_SKIP=false
+        # Validate version format (should be X.Y.Z)
+        if [[ -z "$ZELLIJ_VERSION" ]] || [[ ! "$ZELLIJ_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Warning: Could not fetch valid Zellij version (got: '$ZELLIJ_VERSION'), using v0.43.1 as fallback"
+            ZELLIJ_VERSION="0.43.1"
         fi
+        echo "  - Installing Zellij version $ZELLIJ_VERSION"
+
+        # Detect architecture for Zellij download
+        ZELLIJ_ARCH=$(uname -m)
+        case "$ZELLIJ_ARCH" in
+            x86_64)  ZELLIJ_ARCH_SUFFIX="x86_64-unknown-linux-musl" ;;
+            aarch64) ZELLIJ_ARCH_SUFFIX="aarch64-unknown-linux-musl" ;;
+            *)
+                echo "  ⚠ Warning: Unsupported architecture '$ZELLIJ_ARCH', skipping Zellij installation"
+                ZELLIJ_SKIP=true ;;
+        esac
+
+        # Try to download Zellij, with error handling
+        if [[ "${ZELLIJ_SKIP:-false}" != "true" ]]; then
+            if ! curl -L "https://github.com/zellij-org/zellij/releases/download/v${ZELLIJ_VERSION}/zellij-${ZELLIJ_ARCH_SUFFIX}.tar.gz" -o /tmp/zellij.tar.gz; then
+                echo "  ⚠ Warning: Failed to download Zellij, skipping installation..."
+                ZELLIJ_SKIP=true
+            else
+                ZELLIJ_SKIP=false
+            fi
+        fi
+
+        if [[ "${ZELLIJ_SKIP:-false}" != "true" ]]; then
+            tar -xzf /tmp/zellij.tar.gz -C /tmp
+            mv /tmp/zellij /usr/local/bin/
+            chmod +x /usr/local/bin/zellij
+            rm /tmp/zellij.tar.gz
+
+            # Verify installation
+            if command -v zellij >/dev/null 2>&1; then
+                echo "  ✓ Zellij installed successfully: $(zellij --version)"
+            else
+                echo "  ⚠ Warning: Zellij installation failed, but continuing..."
+            fi
+        fi
+    else
+        echo "  - Skipping Zellij installation."
     fi
 
-    if [[ "${ZELLIJ_SKIP:-false}" != "true" ]]; then
-        tar -xzf /tmp/zellij.tar.gz -C /tmp
-        mv /tmp/zellij /usr/local/bin/
-        chmod +x /usr/local/bin/zellij
-        rm /tmp/zellij.tar.gz
+    echo ""
+    echo "Step 6c: Docker installation..."
+    if [[ "${INSTALL_DOCKER:-y}" == "y" ]]; then
+        echo "  - Adding Docker GPG key..."
+        apt install -y ca-certificates curl
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
 
-        # Verify installation
-        if command -v zellij >/dev/null 2>&1; then
-            echo "  ✓ Zellij installed successfully: $(zellij --version)"
-        else
-            echo "  ⚠ Warning: Zellij installation failed, but continuing..."
+        echo "  - Adding Docker apt repository..."
+        tee /etc/apt/sources.list.d/docker.sources <<'DOCKEREOF'
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: UBUNTU_CODENAME_PLACEHOLDER
+Components: stable
+Architectures: ARCH_PLACEHOLDER
+Signed-By: /etc/apt/keyrings/docker.asc
+DOCKEREOF
+        # Substitute codename and arch at runtime
+        CODENAME=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+        ARCH=$(dpkg --print-architecture)
+        sed -i "s/UBUNTU_CODENAME_PLACEHOLDER/$CODENAME/" /etc/apt/sources.list.d/docker.sources
+        sed -i "s/ARCH_PLACEHOLDER/$ARCH/" /etc/apt/sources.list.d/docker.sources
+
+        apt update
+        apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+        # Add the configured user to the docker group so docker can be used without sudo
+        if [[ -n "$USERNAME" ]]; then
+            usermod -aG docker "$USERNAME"
+            echo "  ✓ User '$USERNAME' added to docker group"
         fi
+        echo "  ✓ Docker installed: $(docker --version)"
+    else
+        echo "  - Skipping Docker installation."
     fi
 
     # Optional: Create datapool if configured
