@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.9
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.10
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -32,6 +32,13 @@ COMPRESSION="lz4"                      # Compression algorithm
 ASHIFT=12            # Sector alignment: 12=4K sectors (SSD/NVMe), 9=512B (legacy HDD)
 ZFS_ATIME="off"      # Disable access-time updates for performance
 ZFS_RELATIME="on"    # Relative atime (updates only if older than 1 day)
+
+# Keyboard layout (set interactively at runtime from live session or manual entry)
+KEYBOARD_LAYOUT="us"               # Keyboard layout code (e.g., us, ch, de, fr)
+KEYBOARD_VARIANT=""                # Keyboard variant (e.g., fr for ch-fr, empty for default)
+
+# APT mirror (selected at runtime by speed test; fallback to official archive)
+APT_MIRROR="https://archive.ubuntu.com/ubuntu"
 
 # Optional datapool configuration (set to empty string to skip)
 DATAPOOL_NAME="ssdupl"                 # Name of the datapool (leave empty to skip auto-creation)
@@ -105,6 +112,34 @@ configure_interactively() {
         COMPRESSION="$input"
     fi
 
+    # Keyboard layout: detect from live session, offer to reuse
+    echo ""
+    local live_layout live_variant
+    if [[ -f /etc/default/keyboard ]]; then
+        live_layout=$(grep '^XKBLAYOUT=' /etc/default/keyboard | cut -d= -f2 | tr -d '"')
+        live_variant=$(grep '^XKBVARIANT=' /etc/default/keyboard | cut -d= -f2 | tr -d '"')
+    fi
+    if [[ -n "$live_layout" ]]; then
+        local kbd_display="$live_layout"
+        [[ -n "$live_variant" ]] && kbd_display="$live_layout/$live_variant"
+        read -rp "Use live-session keyboard layout ($kbd_display)? [Y/n]: " input
+        if [[ ! "$input" =~ ^[Nn]$ ]]; then
+            KEYBOARD_LAYOUT="$live_layout"
+            KEYBOARD_VARIANT="${live_variant:-}"
+        else
+            read -rp "Keyboard layout [$KEYBOARD_LAYOUT]: " input
+            [[ -n "$input" ]] && KEYBOARD_LAYOUT="$input"
+            read -rp "Keyboard variant (leave blank for none) [${KEYBOARD_VARIANT:-}]: " input
+            KEYBOARD_VARIANT="$input"
+        fi
+    else
+        echo "No keyboard layout detected from live session."
+        read -rp "Keyboard layout [$KEYBOARD_LAYOUT]: " input
+        [[ -n "$input" ]] && KEYBOARD_LAYOUT="$input"
+        read -rp "Keyboard variant (leave blank for none) [${KEYBOARD_VARIANT:-}]: " input
+        KEYBOARD_VARIANT="$input"
+    fi
+
     # Datapool: ask yes/no first, then name if yes
     echo ""
     local datapool_yn
@@ -137,6 +172,9 @@ configure_interactively() {
     echo "  Timezone:     $TIMEZONE"
     echo "  Swap size:    $SWAP_SIZE"
     echo "  Compression:  $COMPRESSION"
+    local kbd_summary="$KEYBOARD_LAYOUT"
+    [[ -n "$KEYBOARD_VARIANT" ]] && kbd_summary="$KEYBOARD_LAYOUT/$KEYBOARD_VARIANT"
+    echo "  Keyboard:     $kbd_summary"
     echo "  Datapool:     ${DATAPOOL_NAME:-<none>}"
     echo "======================================================================"
     echo ""
@@ -447,15 +485,62 @@ show_disk_confirmation() {
 }
 
 ################################################################################
+# MIRROR SPEED SELECTION
+################################################################################
+# Tests a set of candidate Ubuntu mirrors and sets APT_MIRROR to the fastest.
+# Falls back to the official archive if all tests fail.
+select_fastest_mirror() {
+    local -a candidates=(
+        "https://archive.ubuntu.com/ubuntu"
+        "https://mirror.init7.net/ubuntu"
+        "https://ubuntu.mirror.liteserver.nl/ubuntu"
+        "https://ftp.halifax.rwth-aachen.de/ubuntu"
+        "https://mirror.de.leaseweb.net/ubuntu"
+        "https://mirrors.edge.kernel.org/ubuntu"
+    )
+
+    echo ""
+    echo "Testing Ubuntu mirrors for fastest response..."
+
+    local best_mirror=""
+    local best_time="999"
+
+    for mirror in "${candidates[@]}"; do
+        local elapsed
+        elapsed=$(curl -s --max-time 5 -o /dev/null \
+            -w "%{time_total}" \
+            "${mirror}/dists/noble/Release" 2>/dev/null || echo "999")
+        # Strip leading zeros for bc comparison
+        local elapsed_clean
+        elapsed_clean=$(echo "$elapsed" | sed 's/^0*//' | sed 's/^\./0./')
+        [[ -z "$elapsed_clean" ]] && elapsed_clean="999"
+        printf "  %-55s %ss\n" "$mirror" "$elapsed"
+        if (( $(echo "$elapsed_clean < $best_time" | bc -l 2>/dev/null || echo 0) )); then
+            best_time="$elapsed_clean"
+            best_mirror="$mirror"
+        fi
+    done
+
+    if [[ -n "$best_mirror" ]] && [[ "$best_time" != "999" ]]; then
+        APT_MIRROR="$best_mirror"
+        echo "  ✓ Selected mirror: $APT_MIRROR (${best_time}s)"
+    else
+        APT_MIRROR="https://archive.ubuntu.com/ubuntu"
+        echo "  ✓ All mirror tests failed, using fallback: $APT_MIRROR"
+    fi
+}
+
+################################################################################
 # INSTALLATION MODE
 ################################################################################
 MODE="${1:-}"
 
 if [[ -z "$MODE" ]]; then
-    echo "Usage: $0 {initial|postreboot}"
+    echo "Usage: $0 {initial|postreboot|reinstall-zbm}"
     echo ""
-    echo "  initial    - Run from live USB to install system"
-    echo "  postreboot - Run after first boot to complete setup"
+    echo "  initial       - Run from live USB to install system"
+    echo "  postreboot    - Run after first boot to complete setup"
+    echo "  reinstall-zbm - Reinstall or update ZFSBootMenu to latest version"
     exit 1
 fi
 
@@ -554,6 +639,9 @@ if [[ "$MODE" == "initial" ]]; then
 
     # Interactively prompt for configuration values (after bc is installed for size validation)
     configure_interactively
+
+    # Select fastest apt mirror (after interactive config, before debootstrap)
+    select_fastest_mirror
 
     # Validate configuration inputs
     echo ""
@@ -716,6 +804,13 @@ if [[ "$MODE" == "initial" ]]; then
     zpool import -N -R /mnt rpool
     zfs mount rpool/ROOT/ubuntu-1
 
+    # Create sub-datasets with tuned properties (before debootstrap populates them)
+    # var/log: disable compression — logs compress poorly and have high write churn
+    zfs create -o canmount=on -o mountpoint=/var         rpool/ROOT/ubuntu-1/var
+    zfs create -o canmount=on -o mountpoint=/var/log \
+               -o compression=off                        rpool/ROOT/ubuntu-1/var/log
+    mkdir -p /mnt/var/log
+
     echo ""
     echo "Step 5: Formatting EFI partition..."
     mkfs.vfat -F32 "$DISK_EFI"
@@ -732,7 +827,7 @@ if [[ "$MODE" == "initial" ]]; then
 
     echo ""
     echo "Step 7: Installing Ubuntu base system..."
-    debootstrap noble /mnt https://archive.ubuntu.com/ubuntu
+    debootstrap noble /mnt "$APT_MIRROR"
 
     # Verify debootstrap succeeded
     echo "Verifying debootstrap installation..."
@@ -784,11 +879,11 @@ ff02::1 ip6-allnodes
 ff02::2 ip6-allrouters
 EOF
 
-    # Configure apt sources (using HTTPS for security)
+    # Configure apt sources (using selected mirror; security always via official archive)
     cat > /mnt/etc/apt/sources.list << EOF
-deb https://archive.ubuntu.com/ubuntu noble main restricted universe multiverse
-deb https://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
-deb https://archive.ubuntu.com/ubuntu noble-security main restricted universe multiverse
+deb $APT_MIRROR noble main restricted universe multiverse
+deb $APT_MIRROR noble-updates main restricted universe multiverse
+deb https://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
 EOF
 
     # Configure basic network (DHCP on all interfaces)
@@ -839,6 +934,17 @@ set -euo pipefail
 locale-gen "$LOCALE"
 update-locale LANG="$LOCALE"
 
+# Configure keyboard layout
+cat > /etc/default/keyboard << KBEOF
+XKBLAYOUT="$KEYBOARD_LAYOUT"
+XKBVARIANT="$KEYBOARD_VARIANT"
+XKBOPTIONS=""
+BACKSPACE="guess"
+KBEOF
+dpkg-reconfigure -f noninteractive keyboard-configuration
+# Apply console keyboard layout (may not succeed in chroot, non-fatal)
+setupcon --force 2>/dev/null || true
+
 # Make transient apt errors fatal so stale package lists don't cause silent failures
 echo 'APT::Update::Error-Mode "any";' > /etc/apt/apt.conf.d/30apt_error_on_transient
 
@@ -856,7 +962,9 @@ apt install -y --no-install-recommends \
     vim \
     htop \
     net-tools \
-    iproute2
+    iproute2 \
+    keyboard-configuration \
+    console-setup
 
 # Configure ZFS in initramfs
 echo "zfs" >> /etc/initramfs-tools/modules
@@ -965,9 +1073,13 @@ echo "Downloading ZFSBootMenu from GitHub..."
 mkdir -p /usr/local/src/zfsbootmenu
 cd /usr/local/src/zfsbootmenu
 
-# Download specific ZFSBootMenu version (pinned for stability)
-# Using v2.3.x release - update this version as needed
-ZBM_VERSION="v2.3.0"
+# Fetch latest ZFSBootMenu release version dynamically
+ZBM_VERSION=\$(curl -s https://api.github.com/repos/zbm-dev/zfsbootmenu/releases/latest \
+    | grep -Po '"tag_name": "\Kv[^"]*' || true)
+if [[ -z "\$ZBM_VERSION" ]] || [[ ! "\$ZBM_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "  Warning: Could not fetch latest ZBM version, falling back to v2.3.0"
+    ZBM_VERSION="v2.3.0"
+fi
 echo "  - Using ZFSBootMenu version: \$ZBM_VERSION"
 git clone --depth 1 --branch "\$ZBM_VERSION" https://github.com/zbm-dev/zfsbootmenu .
 
@@ -1146,6 +1258,8 @@ DISK="$DISK"
 PART_PREFIX="$PART_PREFIX"
 DATAPOOL_NAME="$DATAPOOL_NAME"
 DATAPOOL_MOUNTPOINT="$DATAPOOL_MOUNTPOINT"
+KEYBOARD_LAYOUT="$KEYBOARD_LAYOUT"
+KEYBOARD_VARIANT="$KEYBOARD_VARIANT"
 EOF
     chmod 600 "$INSTALL_DIR/zbm-installer.conf"
     TARGET_UID=$(awk -F: -v user="$USERNAME" '$1==user {print $3}' /mnt/etc/passwd)
@@ -1560,8 +1674,111 @@ EOF
     echo "  syncoid rpool/ROOT/ubuntu-1 backup-server:backup/rpool"
     echo ""
 
+################################################################################
+# REINSTALL / UPDATE ZFSBOOTMENU (Run on installed system)
+################################################################################
+elif [[ "$MODE" == "reinstall-zbm" ]]; then
+    echo "======================================================================"
+    echo "Reinstalling / updating ZFSBootMenu"
+    echo "======================================================================"
+
+    # Verify we're running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This script must be run as root"
+        exit 1
+    fi
+
+    # Verify EFI partition is mounted (sanity check: we're on the installed system)
+    if ! mountpoint -q /boot/efi 2>/dev/null; then
+        echo "Error: /boot/efi is not mounted."
+        echo "Mount it first: mount \$(findmnt -n -o SOURCE /boot/efi) /boot/efi"
+        exit 1
+    fi
+
+    echo ""
+    echo "Step 1: Checking network connectivity..."
+    if ! ping -c 1 -W 5 1.1.1.1 >/dev/null 2>&1 && ! ping -c 1 -W 5 9.9.9.9 >/dev/null 2>&1; then
+        if ! curl -s --max-time 10 -o /dev/null https://api.github.com; then
+            echo "Error: No network connectivity detected."
+            exit 1
+        fi
+        echo "  ✓ Network connectivity verified (HTTPS - ICMP blocked)"
+    else
+        echo "  ✓ Network connectivity verified"
+    fi
+
+    echo ""
+    echo "Step 2: Fetching latest ZFSBootMenu release..."
+    ZBM_VERSION=$(curl -s https://api.github.com/repos/zbm-dev/zfsbootmenu/releases/latest \
+        | grep -Po '"tag_name": "\Kv[^"]*' || true)
+    if [[ -z "$ZBM_VERSION" ]] || [[ ! "$ZBM_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "  Warning: Could not fetch latest ZBM version, falling back to v2.3.0"
+        ZBM_VERSION="v2.3.0"
+    fi
+    echo "  - Target version: $ZBM_VERSION"
+
+    echo ""
+    echo "Step 3: Installing ZFSBootMenu build dependencies..."
+    apt update
+    apt install -y --no-install-recommends \
+        bsdextrautils \
+        mbuffer \
+        libsort-versions-perl \
+        libboolean-perl \
+        libyaml-pp-perl \
+        git \
+        fzf \
+        make \
+        kexec-tools \
+        dracut-core \
+        cpio \
+        curl \
+        systemd-boot \
+        binutils \
+        efibootmgr
+
+    echo ""
+    echo "Step 4: Cloning ZFSBootMenu $ZBM_VERSION..."
+    ZBM_SRC="/usr/local/src/zfsbootmenu"
+    # Back up existing source if present
+    if [[ -d "$ZBM_SRC" ]]; then
+        mv "$ZBM_SRC" "${ZBM_SRC}.bak.$(date +%Y%m%d-%H%M%S)"
+        echo "  - Backed up existing source dir"
+    fi
+    mkdir -p "$ZBM_SRC"
+    git clone --depth 1 --branch "$ZBM_VERSION" https://github.com/zbm-dev/zfsbootmenu "$ZBM_SRC"
+    cd "$ZBM_SRC"
+
+    echo ""
+    echo "Step 5: Compiling and installing ZFSBootMenu..."
+    make core dracut
+    make install
+
+    echo ""
+    echo "Step 6: Regenerating ZFSBootMenu image..."
+    generate-zbm --debug
+
+    # Verify image was created
+    if [[ ! -f /boot/efi/EFI/ZBM/vmlinuz.EFI ]]; then
+        echo "Error: ZFSBootMenu image not found after generation!"
+        exit 1
+    fi
+
+    # Update UEFI fallback path
+    mkdir -p /boot/efi/EFI/BOOT
+    cp /boot/efi/EFI/ZBM/vmlinuz.EFI /boot/efi/EFI/BOOT/BOOTX64.EFI
+    echo "  ✓ Fallback EFI path updated: /EFI/BOOT/BOOTX64.EFI"
+
+    echo ""
+    echo "======================================================================"
+    echo "ZFSBootMenu $ZBM_VERSION installed successfully!"
+    echo "======================================================================"
+    echo ""
+    echo "Run 'update-zbm' at any time to regenerate the boot image."
+    echo ""
+
 else
     echo "Invalid mode: $MODE"
-    echo "Usage: $0 {initial|postreboot}"
+    echo "Usage: $0 {initial|postreboot|reinstall-zbm}"
     exit 1
 fi
