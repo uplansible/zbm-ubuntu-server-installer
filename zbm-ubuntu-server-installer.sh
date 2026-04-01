@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.23
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.24
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -1206,6 +1206,16 @@ EOF
         exit 1
     fi
     rm /mnt/tmp/user-setup.sh
+
+    # Tabby SFTP integration: notify terminal of current directory on each prompt
+    # Written directly (not via chroot heredoc) to avoid quoting/expansion issues
+    cat >> "/mnt/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
+export PS1="$PS1\[\e]1337;CurrentDir="'$(pwd)\a\]'
+PROFILE_EOF
+    # Resolve UID/GID from installed system (user doesn't exist on live host)
+    TARGET_UID=$(grep "^$USERNAME:" /mnt/etc/passwd | cut -d: -f3)
+    TARGET_GID=$(grep "^$USERNAME:" /mnt/etc/passwd | cut -d: -f4)
+    chown "$TARGET_UID:$TARGET_GID" "/mnt/home/$USERNAME/.bash_profile"
     echo "  ✓ User setup completed"
 
     echo ""
