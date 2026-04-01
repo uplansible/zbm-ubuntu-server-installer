@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.30
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.31
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -1120,8 +1120,81 @@ EOF
     echo ""
     echo "Step 9: Installing packages in chroot..."
 
+    # Write APT snapshot cleanup script and systemd units to new system before chroot
+    # (written here with quoted heredocs to avoid $ escaping inside the chroot heredoc)
+    mkdir -p /mnt/usr/local/bin /mnt/etc/systemd/system
+    cat > /mnt/usr/local/bin/cleanup-apt-snapshots.sh << 'EOF'
+#!/bin/bash
+# Cleanup old APT ZFS snapshots — keeps at most KEEP_COUNT newest
+
+set -euo pipefail
+
+DATASET="rpool/ROOT/ubuntu-1"
+SNAPSHOT_PREFIX="apt-"
+KEEP_COUNT=10
+
+snapshots=$(zfs list -H -t snapshot -o name -S creation "${DATASET}" | grep "@${SNAPSHOT_PREFIX}[0-9]" || true)
+
+if [[ -z "$snapshots" ]]; then
+    total=0
+else
+    total=$(echo "$snapshots" | wc -l)
+fi
+
+echo "Found ${total} APT snapshot(s) on ${DATASET}"
+logger -t cleanup-apt-snapshots "Found ${total} APT snapshots on ${DATASET}"
+
+if [[ $total -le $KEEP_COUNT ]]; then
+    echo "No cleanup needed (keeping last ${KEEP_COUNT} snapshots)"
+    logger -t cleanup-apt-snapshots "No cleanup needed"
+    exit 0
+fi
+
+to_delete=$((total - KEEP_COUNT))
+echo "Deleting ${to_delete} old snapshot(s) (keeping newest ${KEEP_COUNT})..."
+
+to_delete_list=$(echo "$snapshots" | tail -n "$to_delete")
+
+while IFS= read -r snapshot; do
+    if [[ -n "$snapshot" ]]; then
+        echo "  Deleting: $snapshot"
+        zfs destroy "$snapshot"
+    fi
+done <<< "$to_delete_list"
+
+echo "Cleanup complete!"
+logger -t cleanup-apt-snapshots "Cleanup complete: deleted ${to_delete} snapshots"
+EOF
+    chmod +x /mnt/usr/local/bin/cleanup-apt-snapshots.sh
+
+    cat > /mnt/etc/systemd/system/cleanup-apt-snapshots.service << 'EOF'
+[Unit]
+Description=Cleanup old APT ZFS snapshots
+Documentation=man:zfs(8)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cleanup-apt-snapshots.sh
+StandardOutput=journal
+StandardError=journal
+EOF
+
+    cat > /mnt/etc/systemd/system/cleanup-apt-snapshots.timer << 'EOF'
+[Unit]
+Description=Twice-daily cleanup of old APT ZFS snapshots
+Documentation=man:zfs(8)
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
     # Create chroot script with proper variable expansion
-    # NOTE: Using unquoted EOF allows variable expansion (e.g., $LOCALE)
+    # NOTE: Using unquoted EOF allows variable expansion for $LOCALE, $INSTALL_DOCKER,
+    # $INSTALL_ZELLIJ, $USERNAME. Use \$ for variables that must be evaluated inside chroot.
     cat > /mnt/tmp/chroot-install.sh << EOF
 #!/bin/bash
 set -euo pipefail
@@ -1148,14 +1221,16 @@ echo 'APT::Update::Error-Mode "any";' > /etc/apt/apt.conf.d/30apt_error_on_trans
 apt update
 apt dist-upgrade -y
 
-# Install required packages
+# Install all packages in one pass
 apt install -y --no-install-recommends \
     locales \
     linux-generic \
     zfs-initramfs \
     zfsutils-linux \
+    zfs-zed \
     cryptsetup \
     openssh-server \
+    ca-certificates \
     curl \
     wget \
     vim \
@@ -1163,27 +1238,119 @@ apt install -y --no-install-recommends \
     net-tools \
     iproute2 \
     keyboard-configuration \
-    console-setup
+    console-setup \
+    ubuntu-server \
+    pv \
+    mbuffer \
+    ncdu \
+    dkms \
+    software-properties-common \
+    sanoid
 
 # Configure ZFS in initramfs
 echo "zfs" >> /etc/initramfs-tools/modules
 
-# Update initramfs
+# Update initramfs (must run after ZFS packages)
 update-initramfs -c -k all
 
-# Enable network services required by the networkd renderer
+# Enable network services
 systemctl enable systemd-networkd
 systemctl enable systemd-resolved
 
-# Mount /tmp as tmpfs (faster, not snapshotted, reduces ZFS CoW pressure)
-# Use fstab instead of tmp.mount unit (unit may not exist in minimal debootstrap)
+# Mount /tmp as tmpfs
 echo "tmpfs /tmp tmpfs defaults,nosuid,nodev,size=2G 0 0" >> /etc/fstab
 
-# Generate netplan backend config files so networkd has .network files on first boot
+# Generate netplan backend config files
 netplan generate
 
 # Point /etc/resolv.conf at systemd-resolved stub resolver
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+
+# Configure Sanoid for rpool
+mkdir -p /etc/sanoid
+cat > /etc/sanoid/sanoid.conf << 'SANEOF'
+# Sanoid configuration for monolithic rpool
+
+[rpool/ROOT/ubuntu-1]
+    use_template = template_production
+    recursive = yes
+
+#############################
+# Templates
+#############################
+[template_production]
+    frequently = 0
+    hourly = 36
+    daily = 30
+    monthly = 6
+    yearly = 0
+    autosnap = yes
+    autoprune = yes
+SANEOF
+
+# APT hook: ZFS snapshot before package upgrades
+cat > /etc/apt/apt.conf.d/80-zfs-snapshot << 'HOOKEOF'
+// Take ZFS snapshot before package upgrades
+DPkg::Pre-Invoke {"if command -v zfs >/dev/null 2>&1; then zfs snapshot rpool/ROOT/ubuntu-1@apt-\$(date +%Y-%m-%d-%H%M%S) || true; fi";};
+HOOKEOF
+
+# Enable Sanoid, cleanup timer, and other services
+systemctl enable sanoid.timer
+systemctl enable cleanup-apt-snapshots.timer
+systemctl enable systemd-timesyncd
+systemctl enable zfs-zed
+
+# Take initial snapshot
+sanoid --take-snapshots --verbose
+
+# Docker install
+if [[ "$INSTALL_DOCKER" == "y" ]]; then
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    CODENAME=\$(. /etc/os-release && echo "\${UBUNTU_CODENAME:-\$VERSION_CODENAME}")
+    ARCH=\$(dpkg --print-architecture)
+    cat > /etc/apt/sources.list.d/docker.sources << DOCKEREOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: \${CODENAME}
+Components: stable
+Architectures: \${ARCH}
+Signed-By: /etc/apt/keyrings/docker.asc
+DOCKEREOF
+    apt update
+    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    usermod -aG docker "$USERNAME"
+    echo "Docker \$(docker --version) installed"
+fi
+
+# Zellij install
+if [[ "$INSTALL_ZELLIJ" == "y" ]]; then
+    ZELLIJ_VERSION=\$(curl -s https://api.github.com/repos/zellij-org/zellij/releases/latest | grep -Po '"tag_name": "v\K[^"]*')
+    if [[ -z "\$ZELLIJ_VERSION" ]] || [[ ! "\$ZELLIJ_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "Warning: Could not fetch Zellij version, using fallback 0.43.1"
+        ZELLIJ_VERSION="0.43.1"
+    fi
+    ZELLIJ_ARCH=\$(uname -m)
+    case "\$ZELLIJ_ARCH" in
+        x86_64)  ZELLIJ_ARCH_SUFFIX="x86_64-unknown-linux-musl" ;;
+        aarch64) ZELLIJ_ARCH_SUFFIX="aarch64-unknown-linux-musl" ;;
+        *)
+            echo "Unsupported architecture '\$ZELLIJ_ARCH', skipping Zellij"
+            ZELLIJ_ARCH_SUFFIX="" ;;
+    esac
+    if [[ -n "\$ZELLIJ_ARCH_SUFFIX" ]]; then
+        if curl -L "https://github.com/zellij-org/zellij/releases/download/v\${ZELLIJ_VERSION}/zellij-\${ZELLIJ_ARCH_SUFFIX}.tar.gz" -o /tmp/zellij.tar.gz; then
+            tar -xzf /tmp/zellij.tar.gz -C /tmp
+            mv /tmp/zellij /usr/local/bin/
+            chmod +x /usr/local/bin/zellij
+            rm /tmp/zellij.tar.gz
+            echo "Zellij \$(zellij --version) installed"
+        else
+            echo "Warning: Failed to download Zellij, skipping"
+        fi
+    fi
+fi
 
 EOF
 
@@ -1600,245 +1767,15 @@ elif [[ "$MODE" == "postreboot" ]]; then
     trap cleanup_postreboot ERR
 
     echo ""
-    echo "Step 1: Installing Sanoid..."
-    apt update
-    apt install -y sanoid
-
-    echo ""
-    echo "Step 2: Configuring Sanoid for rpool..."
-
-    # Ensure sanoid config directory exists
-    mkdir -p /etc/sanoid
-
-    # NOTE: Using quoted 'EOF' prevents variable expansion (literal Sanoid config)
-    cat > /etc/sanoid/sanoid.conf << 'EOF'
-# Sanoid configuration for monolithic rpool
-
-[rpool/ROOT/ubuntu-1]
-    use_template = template_production
-    recursive = yes
-
-#############################
-# Templates
-#############################
-[template_production]
-    frequently = 0
-    hourly = 36
-    daily = 30
-    monthly = 6
-    yearly = 0
-    autosnap = yes
-    autoprune = yes
-EOF
-
-    echo ""
-    echo "Step 3: Enabling Sanoid timer..."
+    echo "Step 1: Starting snapshot timers..."
     systemctl enable --now sanoid.timer
-
-    echo ""
-    echo "Step 4: Taking initial snapshot..."
-    sanoid --take-snapshots --verbose
-
-    echo ""
-    echo "Step 5: Setting up APT hook for pre-update snapshots..."
-
-    # NOTE: Using quoted 'EOF' prevents variable expansion (literal APT hook config)
-    cat > /etc/apt/apt.conf.d/80-zfs-snapshot << 'EOF'
-// Take ZFS snapshot before package upgrades
-DPkg::Pre-Invoke {"if command -v zfs >/dev/null 2>&1; then zfs snapshot rpool/ROOT/ubuntu-1@apt-$(date +%Y-%m-%d-%H%M%S) || true; fi";};
-EOF
-
-    echo ""
-    echo "Step 5a: Installing APT snapshot cleanup script..."
-
-    # Create cleanup script
-    cat > /usr/local/bin/cleanup-apt-snapshots.sh << 'EOF'
-#!/bin/bash
-# Cleanup old APT ZFS snapshots — keeps at most KEEP_COUNT newest
-
-set -euo pipefail
-
-DATASET="rpool/ROOT/ubuntu-1"
-SNAPSHOT_PREFIX="apt-"
-KEEP_COUNT=10
-
-# Get all apt snapshots sorted newest-first
-snapshots=$(zfs list -H -t snapshot -o name -S creation "${DATASET}" | grep "@${SNAPSHOT_PREFIX}[0-9]" || true)
-
-if [[ -z "$snapshots" ]]; then
-    total=0
-else
-    total=$(echo "$snapshots" | wc -l)
-fi
-
-echo "Found ${total} APT snapshot(s) on ${DATASET}"
-logger -t cleanup-apt-snapshots "Found ${total} APT snapshots on ${DATASET}"
-
-if [[ $total -le $KEEP_COUNT ]]; then
-    echo "No cleanup needed (keeping last ${KEEP_COUNT} snapshots)"
-    logger -t cleanup-apt-snapshots "No cleanup needed"
-    exit 0
-fi
-
-to_delete=$((total - KEEP_COUNT))
-echo "Deleting ${to_delete} old snapshot(s) (keeping newest ${KEEP_COUNT})..."
-
-# tail gets the oldest snapshots (list is newest-first)
-to_delete_list=$(echo "$snapshots" | tail -n "$to_delete")
-
-while IFS= read -r snapshot; do
-    if [[ -n "$snapshot" ]]; then
-        echo "  Deleting: $snapshot"
-        zfs destroy "$snapshot"
-    fi
-done <<< "$to_delete_list"
-
-echo "Cleanup complete!"
-logger -t cleanup-apt-snapshots "Cleanup complete: deleted ${to_delete} snapshots"
-EOF
-
-    chmod +x /usr/local/bin/cleanup-apt-snapshots.sh
-
-    # Create systemd service
-    cat > /etc/systemd/system/cleanup-apt-snapshots.service << 'EOF'
-[Unit]
-Description=Cleanup old APT ZFS snapshots
-Documentation=man:zfs(8)
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/cleanup-apt-snapshots.sh
-StandardOutput=journal
-StandardError=journal
-EOF
-
-    # Create systemd timer (runs every 12 hours)
-    cat > /etc/systemd/system/cleanup-apt-snapshots.timer << 'EOF'
-[Unit]
-Description=Twice-daily cleanup of old APT ZFS snapshots
-Documentation=man:zfs(8)
-
-[Timer]
-OnCalendar=*-*-* 00,12:00:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    # Enable and start timer
-    systemctl daemon-reload
     systemctl enable --now cleanup-apt-snapshots.timer
-
-    echo "  ✓ APT snapshot cleanup configured (keeps last 10 snapshots, runs every 12 hours)"
-
-    echo ""
-    echo "Step 6: Installing additional useful tools..."
-    apt install -y \
-        ubuntu-server \
-        pv \
-        mbuffer \
-        ncdu \
-        zfs-zed
-
-    echo ""
-    echo "Step 6a: Enabling system services..."
-    echo "  - Enabling systemd-timesyncd for NTP..."
-    systemctl enable --now systemd-timesyncd
-    echo "  - Enabling zfs-zed for pool event monitoring..."
-    systemctl enable --now zfs-zed
-
-    echo ""
-    echo "Step 6b: Installing Zellij terminal multiplexer..."
-    if [[ "${INSTALL_ZELLIJ:-y}" == "y" ]]; then
-        # Install Zellij from official release
-        ZELLIJ_VERSION=$(curl -s https://api.github.com/repos/zellij-org/zellij/releases/latest | grep -Po '"tag_name": "v\K[^"]*')
-
-        # Validate version format (should be X.Y.Z)
-        if [[ -z "$ZELLIJ_VERSION" ]] || [[ ! "$ZELLIJ_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Warning: Could not fetch valid Zellij version (got: '$ZELLIJ_VERSION'), using v0.43.1 as fallback"
-            ZELLIJ_VERSION="0.43.1"
-        fi
-        echo "  - Installing Zellij version $ZELLIJ_VERSION"
-
-        # Detect architecture for Zellij download
-        ZELLIJ_ARCH=$(uname -m)
-        case "$ZELLIJ_ARCH" in
-            x86_64)  ZELLIJ_ARCH_SUFFIX="x86_64-unknown-linux-musl" ;;
-            aarch64) ZELLIJ_ARCH_SUFFIX="aarch64-unknown-linux-musl" ;;
-            *)
-                echo "  ⚠ Warning: Unsupported architecture '$ZELLIJ_ARCH', skipping Zellij installation"
-                ZELLIJ_SKIP=true ;;
-        esac
-
-        # Try to download Zellij, with error handling
-        if [[ "${ZELLIJ_SKIP:-false}" != "true" ]]; then
-            if ! curl -L "https://github.com/zellij-org/zellij/releases/download/v${ZELLIJ_VERSION}/zellij-${ZELLIJ_ARCH_SUFFIX}.tar.gz" -o /tmp/zellij.tar.gz; then
-                echo "  ⚠ Warning: Failed to download Zellij, skipping installation..."
-                ZELLIJ_SKIP=true
-            else
-                ZELLIJ_SKIP=false
-            fi
-        fi
-
-        if [[ "${ZELLIJ_SKIP:-false}" != "true" ]]; then
-            tar -xzf /tmp/zellij.tar.gz -C /tmp
-            mv /tmp/zellij /usr/local/bin/
-            chmod +x /usr/local/bin/zellij
-            rm /tmp/zellij.tar.gz
-
-            # Verify installation
-            if command -v zellij >/dev/null 2>&1; then
-                echo "  ✓ Zellij installed successfully: $(zellij --version)"
-            else
-                echo "  ⚠ Warning: Zellij installation failed, but continuing..."
-            fi
-        fi
-    else
-        echo "  - Skipping Zellij installation."
-    fi
-
-    echo ""
-    echo "Step 6c: Docker installation..."
-    if [[ "${INSTALL_DOCKER:-y}" == "y" ]]; then
-        echo "  - Adding Docker GPG key..."
-        apt install -y ca-certificates curl
-        install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-        chmod a+r /etc/apt/keyrings/docker.asc
-
-        echo "  - Adding Docker apt repository..."
-        tee /etc/apt/sources.list.d/docker.sources <<'DOCKEREOF'
-Types: deb
-URIs: https://download.docker.com/linux/ubuntu
-Suites: UBUNTU_CODENAME_PLACEHOLDER
-Components: stable
-Architectures: ARCH_PLACEHOLDER
-Signed-By: /etc/apt/keyrings/docker.asc
-DOCKEREOF
-        # Substitute codename and arch at runtime
-        CODENAME=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
-        ARCH=$(dpkg --print-architecture)
-        sed -i "s/UBUNTU_CODENAME_PLACEHOLDER/$CODENAME/" /etc/apt/sources.list.d/docker.sources
-        sed -i "s/ARCH_PLACEHOLDER/$ARCH/" /etc/apt/sources.list.d/docker.sources
-
-        apt update
-        apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-        # Add the configured user to the docker group so docker can be used without sudo
-        if [[ -n "$USERNAME" ]]; then
-            usermod -aG docker "$USERNAME"
-            echo "  ✓ User '$USERNAME' added to docker group"
-        fi
-        echo "  ✓ Docker installed: $(docker --version)"
-    else
-        echo "  - Skipping Docker installation."
-    fi
+    echo "  ✓ Sanoid and cleanup timers active"
 
     # Optional: Create datapool if configured
     if [[ -n "$DATAPOOL_NAME" ]]; then
         echo ""
-        echo "Step 7: Creating datapool '$DATAPOOL_NAME'..."
+        echo "Step 2: Creating datapool '$DATAPOOL_NAME'..."
 
         # Detect partition naming
         if [[ "$DISK" =~ nvme|mmcblk|loop ]]; then
@@ -1889,7 +1826,7 @@ EOF
         echo "  ✓ Sanoid configured for $DATAPOOL_NAME"
     else
         echo ""
-        echo "Step 7: Skipping datapool creation (DATAPOOL_NAME not set)"
+        echo "Step 2: Skipping datapool creation (DATAPOOL_NAME not set)"
     fi
 
     echo ""
