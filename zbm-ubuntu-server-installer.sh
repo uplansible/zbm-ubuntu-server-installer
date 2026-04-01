@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.21
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.22
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -598,54 +598,27 @@ show_disk_confirmation() {
 ################################################################################
 # MIRROR SPEED SELECTION
 ################################################################################
-# Fetches the GeoIP-filtered mirror list from mirrors.ubuntu.com, then measures
-# actual download throughput (bytes/sec) for each candidate using curl+awk.
-# Falls back to a built-in list if the fetch fails, and to the official archive
-# if all throughput tests return zero. Uses awk for float comparison (no bc).
+# Tests a hardcoded set of well-known Ubuntu mirrors and selects the fastest
+# based on actual download throughput (bytes/sec) via curl+awk.
+# Falls back to the official archive if all tests return zero speed.
+# Note: mirrors.ubuntu.com/mirrors.txt was evaluated but HTTPS times out and
+# HTTP only returns archive.ubuntu.com, so a curated hardcoded list is used.
 select_fastest_mirror() {
-    local mirror_list_url="https://mirrors.ubuntu.com/mirrors.txt"
     local test_path="dists/noble/main/binary-amd64/Packages.gz"
-    local max_candidates=6
     local curl_timeout=5
     local fallback="https://archive.ubuntu.com/ubuntu"
 
+    local -a candidates=(
+        "https://archive.ubuntu.com/ubuntu"
+        "https://mirror.init7.net/ubuntu"
+        "https://ubuntu.mirror.liteserver.nl/ubuntu"
+        "https://ftp.halifax.rwth-aachen.de/ubuntu"
+        "https://mirror.de.leaseweb.net/ubuntu"
+        "https://mirrors.edge.kernel.org/ubuntu"
+    )
+
     echo ""
-    echo "Fetching regional Ubuntu mirror list..."
-
-    local -a candidates=()
-
-    local raw_list
-    # -L follows redirects; mirrors.ubuntu.com/mirrors.txt returns http:// URLs,
-    # so we accept both http:// and https://, and strip any trailing slash
-    if raw_list=$(curl -sL --max-time 10 "$mirror_list_url" 2>/dev/null) && [[ -n "$raw_list" ]]; then
-        mapfile -t candidates < <(
-            printf '%s\n' "$raw_list" \
-            | awk '/^https?:\/\// { gsub(/\/$/, ""); print $1 }' \
-            | awk '!seen[$0]++' \
-            | head -n "$max_candidates"
-        )
-        echo "  Retrieved ${#candidates[@]} regional mirrors"
-    else
-        echo "  Could not fetch mirror list, using built-in candidates."
-    fi
-
-    # Ensure the official fallback is always included
-    local already_present=0
-    for c in "${candidates[@]+"${candidates[@]}"}"; do
-        [[ "$c" == "$fallback" ]] && already_present=1 && break
-    done
-    (( already_present == 0 )) && candidates+=("$fallback")
-
-    # If the dynamic fetch produced nothing, add a minimal built-in set
-    if (( ${#candidates[@]} == 1 )); then
-        candidates+=(
-            "https://mirror.init7.net/ubuntu"
-            "https://ftp.halifax.rwth-aachen.de/ubuntu"
-            "https://mirrors.edge.kernel.org/ubuntu"
-        )
-    fi
-
-    echo "  Testing ${#candidates[@]} mirrors for download throughput..."
+    echo "Testing Ubuntu mirrors for download speed..."
 
     local best_mirror=""
     local best_speed="0"
