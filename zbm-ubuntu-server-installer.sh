@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.32
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.33
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -22,8 +22,8 @@ LOCALE="en_GB.UTF-8"                   # System locale (British English: metric 
 
 # Pool configuration
 RPOOL_PERCENT=80                       # Percentage of remaining disk for rpool (1-99)
-SWAP_SIZE="8G"                         # Swap partition size
-EFI_SIZE="1G"                          # EFI partition size
+SWAP_SIZE=8192                         # Swap partition size in MiB (set interactively based on RAM)
+EFI_SIZE=1024                          # EFI partition size in MiB (1024 MiB = 1 GiB)
 
 # ZFS properties
 COMPRESSION="lz4"                      # Compression algorithm
@@ -164,18 +164,18 @@ configure_interactively() {
     # Swap size - auto-detect RAM and suggest an appropriate size
     local ram_gb
     ram_gb=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
-    local suggested_swap
+    local suggested_swap_gib
     if [[ $ram_gb -le 2 ]]; then
-        suggested_swap="2G"
+        suggested_swap_gib=2
     elif [[ $ram_gb -le 8 ]]; then
-        suggested_swap="${ram_gb}G"
+        suggested_swap_gib=$ram_gb
     else
-        suggested_swap="8G"
+        suggested_swap_gib=8
     fi
-    SWAP_SIZE="$suggested_swap"
-    read -rp "Swap size (detected RAM: ${ram_gb}GB, suggested: ${suggested_swap}) [$suggested_swap]: " input
+    SWAP_SIZE=$(( suggested_swap_gib * 1024 ))
+    read -rp "Swap size in GiB (detected RAM: ${ram_gb}GiB, suggested: ${suggested_swap_gib}GiB) [${suggested_swap_gib}]: " input
     if [[ -n "$input" ]]; then
-        SWAP_SIZE="$input"
+        SWAP_SIZE=$(( input * 1024 ))
     fi
 
     # Locale (interactive search)
@@ -257,7 +257,7 @@ configure_interactively() {
     echo "  Password:     (set)"
     echo "  Timezone:     $TIMEZONE"
     echo "  Locale:       $LOCALE"
-    echo "  Swap size:    $SWAP_SIZE"
+    echo "  Swap size:    $(( SWAP_SIZE / 1024 ))GiB"
     echo "  Compression:  $COMPRESSION"
     local kbd_summary="$KEYBOARD_LAYOUT"
     [[ -n "$KEYBOARD_VARIANT" ]] && kbd_summary="$KEYBOARD_LAYOUT/$KEYBOARD_VARIANT"
@@ -302,16 +302,15 @@ validate_inputs() {
         exit 1
     fi
 
-    # Validate size format (must end with G, supports decimals)
-    if [[ ! "$EFI_SIZE" =~ ^[0-9]+(\.[0-9]+)?[GM]$ ]]; then
-        echo "Error: Invalid EFI_SIZE '$EFI_SIZE'."
-        echo "       Must be in format: numberG or numberM (e.g., 1G, 512M, 1.5G)"
+    # Validate EFI_SIZE (integer MiB, minimum 256 MiB)
+    if [[ ! "$EFI_SIZE" =~ ^[0-9]+$ ]] || [[ "$EFI_SIZE" -lt 256 ]]; then
+        echo "Error: Invalid EFI_SIZE '$EFI_SIZE'. Must be a positive integer in MiB (minimum 256)."
         exit 1
     fi
 
-    if [[ ! "$SWAP_SIZE" =~ ^[0-9]+(\.[0-9]+)?[GM]$ ]]; then
-        echo "Error: Invalid SWAP_SIZE '$SWAP_SIZE'."
-        echo "       Must be in format: numberG or numberM (e.g., 8G, 16G, 8.5G)"
+    # Validate SWAP_SIZE (integer MiB, minimum 512 MiB)
+    if [[ ! "$SWAP_SIZE" =~ ^[0-9]+$ ]] || [[ "$SWAP_SIZE" -lt 512 ]]; then
+        echo "Error: Invalid SWAP_SIZE '$SWAP_SIZE'. Must be a positive integer in MiB (minimum 512)."
         exit 1
     fi
 
@@ -354,41 +353,22 @@ validate_inputs() {
     fi
 }
 
-# Convert size strings (e.g., 1G, 512M, 1.5G) to GB as a decimal number
-convert_to_gb() {
-    local size=$1
-    if [[ $size =~ ^([0-9]+(\.[0-9]+)?)G$ ]]; then
-        echo "${BASH_REMATCH[1]}"
-    elif [[ $size =~ ^([0-9]+(\.[0-9]+)?)M$ ]]; then
-        # Convert MB to GB (divide by 1024)
-        echo "scale=2; ${BASH_REMATCH[1]} / 1024" | bc
-    else
-        echo "0"
-    fi
-}
-
 validate_disk_size() {
     local disk=$1
 
-    # Get disk size in bytes
-    local disk_bytes=$(blockdev --getsize64 "$disk")
-    local disk_gb=$((disk_bytes / 1024 / 1024 / 1024))
+    local disk_bytes
+    disk_bytes=$(blockdev --getsize64 "$disk")
+    local disk_mib=$(( disk_bytes / 1024 / 1024 ))
 
-    local efi_gb=$(convert_to_gb "$EFI_SIZE")
-    local swap_gb=$(convert_to_gb "$SWAP_SIZE")
+    # Minimum required: EFI + Swap + 2 GiB alignment buffer
+    local required_mib=$(( EFI_SIZE + SWAP_SIZE + 2048 ))
 
-    # Calculate minimum required space (EFI + Swap + 2GB buffer for alignment)
-    # RPOOL_SIZE is not checked here — it's derived as a percentage of remaining space
-    local required_gb=$(echo "$efi_gb + $swap_gb + 2" | bc)
-    local required_gb_int=$(echo "$required_gb / 1" | bc)  # Integer for comparison
+    echo "Disk size: $(( disk_mib / 1024 ))GiB"
+    echo "Required:  $(( required_mib / 1024 ))GiB  (EFI: $(( EFI_SIZE / 1024 ))GiB, Swap: $(( SWAP_SIZE / 1024 ))GiB, buffer: 2GiB)"
 
-    echo "Disk size: ${disk_gb}GB"
-    echo "Required space: ${required_gb}GB (EFI: ${efi_gb}GB, Swap: ${swap_gb}GB, buffer: 2GB)"
-
-    if [[ $disk_gb -lt $required_gb_int ]]; then
+    if [[ $disk_mib -lt $required_mib ]]; then
         echo "Error: Disk is too small!"
-        echo "       Disk size: ${disk_gb}GB"
-        echo "       Required: ${required_gb}GB minimum"
+        echo "       Disk: $(( disk_mib / 1024 ))GiB,  Required: $(( required_mib / 1024 ))GiB minimum"
         exit 1
     fi
 
@@ -485,41 +465,31 @@ select_disk() {
 }
 
 # Show a breakdown of available space and prompt for rpool percentage.
-# Reads: DISK, EFI_SIZE, SWAP_SIZE, RPOOL_PERCENT (default)
-# Sets: RPOOL_SIZE (e.g., "75G")
+# Reads: DISK, EFI_SIZE, SWAP_SIZE (MiB), RPOOL_PERCENT (default)
+# Sets: RPOOL_SIZE in MiB
 select_rpool_percent() {
     local disk=$1
 
     local disk_bytes
     disk_bytes=$(blockdev --getsize64 "$disk")
-    local disk_gb=$((disk_bytes / 1024 / 1024 / 1024))
+    local disk_mib=$(( disk_bytes / 1024 / 1024 ))
 
-    local efi_gb swap_gb
-    efi_gb=$(convert_to_gb "$EFI_SIZE")
-    swap_gb=$(convert_to_gb "$SWAP_SIZE")
-
-    # Remaining space after EFI, swap, and 2 GB alignment buffer
-    local remaining_gb
-    remaining_gb=$(echo "$disk_gb - $efi_gb - $swap_gb - 2" | bc)
-    local remaining_gb_int
-    remaining_gb_int=$(echo "$remaining_gb / 1" | bc)
+    # Remaining space after EFI, swap, and 2 GiB alignment buffer
+    local remaining_mib=$(( disk_mib - EFI_SIZE - SWAP_SIZE - 2048 ))
 
     # Default rpool size from RPOOL_PERCENT
-    local default_rpool_gb
-    default_rpool_gb=$(echo "$remaining_gb * $RPOOL_PERCENT / 100" | bc)
-    local default_rpool_gb_int
-    default_rpool_gb_int=$(echo "$default_rpool_gb / 1" | bc)
+    local default_rpool_mib=$(( remaining_mib * RPOOL_PERCENT / 100 ))
 
     echo ""
     echo "======================================================================"
     echo "Disk space breakdown for $disk:"
-    echo "  Total disk:          ${disk_gb}G"
-    echo "  EFI partition:     - ${efi_gb}G"
-    echo "  Swap partition:    - ${swap_gb}G"
-    echo "  Alignment buffer:  - 2G"
-    printf "  Available for rpool: %dG\n" "$remaining_gb_int"
+    printf "  Total disk:          %dGiB\n" "$(( disk_mib / 1024 ))"
+    printf "  EFI partition:     - %dGiB\n" "$(( EFI_SIZE / 1024 ))"
+    printf "  Swap partition:    - %dGiB\n" "$(( SWAP_SIZE / 1024 ))"
+    printf "  Alignment buffer:  - 2GiB\n"
+    printf "  Available for rpool: %dGiB\n" "$(( remaining_mib / 1024 ))"
     echo "======================================================================"
-    printf "Default rpool size: %d%% = %dG\n" "$RPOOL_PERCENT" "$default_rpool_gb_int"
+    printf "Default rpool size: %d%% = %dGiB\n" "$RPOOL_PERCENT" "$(( default_rpool_mib / 1024 ))"
     echo ""
 
     local pct
@@ -536,15 +506,12 @@ select_rpool_percent() {
             continue
         fi
 
-        local rpool_gb_calc
-        rpool_gb_calc=$(echo "$remaining_gb * $pct / 100" | bc)
-        local rpool_gb_int
-        rpool_gb_int=$(echo "$rpool_gb_calc / 1" | bc)
+        local rpool_mib=$(( remaining_mib * pct / 100 ))
 
-        # Soft warning if result is less than 10 GB
-        if [[ $rpool_gb_int -lt 10 ]]; then
-            echo "Warning: ${pct}% of available space is only ${rpool_gb_int}G."
-            echo "This may be too small for a functional system (recommended: at least 10G)."
+        # Soft warning if result is less than 10 GiB
+        if [[ $rpool_mib -lt 10240 ]]; then
+            echo "Warning: ${pct}% of available space is only $(( rpool_mib / 1024 ))GiB."
+            echo "This may be too small for a functional system (recommended: at least 10GiB)."
             local yn
             read -rp "Continue anyway? [y/N]: " yn
             if [[ ! "$yn" =~ ^[Yy]$ ]]; then
@@ -552,8 +519,8 @@ select_rpool_percent() {
             fi
         fi
 
-        RPOOL_SIZE="${rpool_gb_int}G"
-        echo "rpool size set to: $RPOOL_SIZE"
+        RPOOL_SIZE=$rpool_mib
+        echo "rpool size set to: $(( RPOOL_SIZE / 1024 ))GiB"
         break
     done
 }
@@ -566,19 +533,11 @@ show_disk_confirmation() {
 
     local disk_bytes
     disk_bytes=$(blockdev --getsize64 "$disk")
-    local disk_gb=$((disk_bytes / 1024 / 1024 / 1024))
+    local disk_mib=$(( disk_bytes / 1024 / 1024 ))
 
-    local efi_gb swap_gb rpool_gb
-    efi_gb=$(convert_to_gb "$EFI_SIZE")
-    swap_gb=$(convert_to_gb "$SWAP_SIZE")
-    rpool_gb=$(convert_to_gb "$RPOOL_SIZE")
-
-    local datapool_gb
-    datapool_gb=$(echo "$disk_gb - $efi_gb - $swap_gb - $rpool_gb - 2" | bc)
-    local datapool_gb_int
-    datapool_gb_int=$(echo "$datapool_gb / 1" | bc)
+    local datapool_mib=$(( disk_mib - EFI_SIZE - SWAP_SIZE - RPOOL_SIZE - 2048 ))
     # Clamp to 0 if negative (shouldn't happen, but be safe)
-    if [[ $datapool_gb_int -lt 0 ]]; then datapool_gb_int=0; fi
+    if [[ $datapool_mib -lt 0 ]]; then datapool_mib=0; fi
 
     local datapool_label="${DATAPOOL_NAME:-<none>}"
 
@@ -587,13 +546,13 @@ show_disk_confirmation() {
     echo "INSTALLATION SUMMARY"
     echo "======================================================================"
     echo ""
-    echo "Target disk:  $disk  (${disk_gb}G total)"
+    printf "Target disk:  %s  (%dGiB total)\n" "$disk" "$(( disk_mib / 1024 ))"
     echo ""
     echo "Partition layout:"
-    printf "  Partition 1 (EFI):      %s\n"     "$EFI_SIZE"
-    printf "  Partition 2 (Swap):     %s\n"     "$SWAP_SIZE"
-    printf "  Partition 3 (rpool):    %s\n"     "$RPOOL_SIZE"
-    printf "  Partition 4 (datapool): ~%dG (remaining)\n" "$datapool_gb_int"
+    printf "  Partition 1 (EFI):      %dGiB\n"     "$(( EFI_SIZE / 1024 ))"
+    printf "  Partition 2 (Swap):     %dGiB\n"     "$(( SWAP_SIZE / 1024 ))"
+    printf "  Partition 3 (rpool):    %dGiB\n"     "$(( RPOOL_SIZE / 1024 ))"
+    printf "  Partition 4 (datapool): ~%dGiB (remaining)\n" "$(( datapool_mib / 1024 ))"
     echo ""
     echo "System configuration:"
     echo "  Hostname:     $HOSTNAME"
@@ -758,6 +717,8 @@ if [[ "$MODE" == "initial" ]]; then
     # Set up error trap
     trap cleanup_on_error ERR
 
+    # ── PRE-FLIGHT CHECKS (abort before any user interaction) ──────────────────
+
     # Verify we're running as root
     if [[ $EUID -ne 0 ]]; then
         echo "This script must be run as root"
@@ -772,20 +733,13 @@ if [[ "$MODE" == "initial" ]]; then
     fi
     echo "  ✓ EFI boot environment confirmed"
 
-    # Start logging all output to a persistent install log
-    INSTALL_LOG="/var/log/zbm-install.log"
-    exec > >(tee -a "$INSTALL_LOG") 2>&1
-    echo "Installation log: $INSTALL_LOG"
-
-    echo "======================================================================"
-    echo "Starting Ubuntu 24.04 ZFSBootMenu Installation"
-    echo "======================================================================"
-
+    # Verify network connectivity before any user interaction
     echo ""
-    echo "Step 1: Checking network connectivity..."
+    echo "Checking network connectivity..."
     if ! ping -c 1 -W 5 1.1.1.1 >/dev/null 2>&1 && ! ping -c 1 -W 5 9.9.9.9 >/dev/null 2>&1; then
-        # ICMP may be blocked; try HTTPS as fallback
-        if ! curl -s --max-time 10 -o /dev/null https://archive.ubuntu.com; then
+        # ICMP may be blocked; try curl then wget as HTTPS fallback
+        if ! curl -s --max-time 10 -o /dev/null https://archive.ubuntu.com 2>/dev/null \
+            && ! wget -q --spider --timeout=10 https://archive.ubuntu.com 2>/dev/null; then
             echo "Error: No network connectivity detected (tested ICMP and HTTPS)!"
             echo "This script requires internet access for:"
             echo "  - Package downloads (apt, debootstrap)"
@@ -803,17 +757,8 @@ if [[ "$MODE" == "initial" ]]; then
     sed -i 's,#precedence ::ffff:0:0/96  100,precedence ::ffff:0:0/96  100,' /etc/gai.conf
     echo "  ✓ IPv4 preferred for apt (IPv6 workaround applied)"
 
-    echo ""
-    echo "Step 2: Installing prerequisites..."
-    apt update
-    # curl is included here so select_fastest_mirror (called next) can use it;
-    # the live ISO may not ship curl, and we need it for mirror speed testing
-    apt install -y curl debootstrap gdisk zfs-initramfs bc
+    # ── INTERACTIVE CONFIGURATION ──────────────────────────────────────────────
 
-    # Select fastest apt mirror now that curl is guaranteed to be available
-    select_fastest_mirror
-
-    # Interactively prompt for configuration values (after bc is installed for size validation)
     configure_interactively
 
     # Validate configuration inputs
@@ -839,8 +784,28 @@ if [[ "$MODE" == "initial" ]]; then
     # Interactively select rpool percentage and compute RPOOL_SIZE
     select_rpool_percent "$DISK"
 
-    # Show full confirmation table and require explicit YES before destructive steps
+    # Show full confirmation table and require explicit YES before any destructive steps
     show_disk_confirmation "$DISK"
+
+    # ── INSTALLATION (all user input done, nothing below is interactive) ────────
+
+    # Start logging all output to a persistent install log
+    INSTALL_LOG="/var/log/zbm-install.log"
+    exec > >(tee -a "$INSTALL_LOG") 2>&1
+    echo "Installation log: $INSTALL_LOG"
+
+    echo "======================================================================"
+    echo "Starting Ubuntu 24.04 ZFSBootMenu Installation"
+    echo "======================================================================"
+
+    echo ""
+    echo "Step 1: Installing prerequisites..."
+    apt update
+    # curl needed for select_fastest_mirror and chroot downloads
+    apt install -y curl debootstrap gdisk zfs-initramfs
+
+    # Select fastest apt mirror now that curl is guaranteed to be available
+    select_fastest_mirror
 
     # Verify ZFS module is loaded or can be loaded
     echo "Verifying ZFS module..."
@@ -859,7 +824,7 @@ if [[ "$MODE" == "initial" ]]; then
     echo "  ✓ ZFS module loaded and /dev/zfs available"
 
     echo ""
-    echo "Step 3: Partitioning disk $DISK..."
+    echo "Step 2: Partitioning disk $DISK..."
 
     # Check if any partitions on the disk are mounted
     echo "Checking for mounted partitions on $DISK..."
@@ -882,9 +847,9 @@ if [[ "$MODE" == "initial" ]]; then
     fi
 
     sgdisk --zap-all "$DISK"
-    sgdisk -n1:0:+${EFI_SIZE} -t1:EF00 "$DISK"      # EFI
-    sgdisk -n2:0:+${SWAP_SIZE} -t2:8200 "$DISK"     # Swap
-    sgdisk -n3:0:+${RPOOL_SIZE} -t3:BF00 "$DISK"    # rpool
+    sgdisk -n1:0:+${EFI_SIZE}M -t1:EF00 "$DISK"     # EFI  (MiB)
+    sgdisk -n2:0:+${SWAP_SIZE}M -t2:8200 "$DISK"    # Swap (MiB)
+    sgdisk -n3:0:+${RPOOL_SIZE}M -t3:BF00 "$DISK"   # rpool (MiB)
     if [[ -n "$DATAPOOL_NAME" ]]; then
         sgdisk -n4:0:0 -t4:BF00 "$DISK"             # datapool (ZFS partition)
     fi
@@ -975,7 +940,7 @@ if [[ "$MODE" == "initial" ]]; then
     fi
 
     echo ""
-    echo "Step 4: Creating ZFS root pool..."
+    echo "Step 3: Creating ZFS root pool..."
     # Create rpool with monolithic structure
     zpool create -f \
         -o ashift=$ASHIFT \
@@ -1008,13 +973,13 @@ if [[ "$MODE" == "initial" ]]; then
     mkdir -p /mnt/var/log
 
     echo ""
-    echo "Step 5: Formatting EFI partition..."
+    echo "Step 4: Formatting EFI partition..."
     mkfs.vfat -F32 "$DISK_EFI"
     mkdir -p /mnt/boot/efi
     mount "$DISK_EFI" /mnt/boot/efi
 
     echo ""
-    echo "Step 6: Setting up swap..."
+    echo "Step 5: Setting up swap..."
     # Swap will be encrypted at boot via crypttab (ephemeral random key per boot)
     # No mkswap needed — cryptsetup will format the swap device on each boot
 
@@ -1022,7 +987,7 @@ if [[ "$MODE" == "initial" ]]; then
     DISK_EFI_UUID=$(blkid -s UUID -o value "$DISK_EFI")
 
     echo ""
-    echo "Step 7: Installing Ubuntu base system..."
+    echo "Step 6: Installing Ubuntu base system..."
     debootstrap noble /mnt "$APT_MIRROR"
 
     # Verify debootstrap succeeded
@@ -1041,7 +1006,7 @@ if [[ "$MODE" == "initial" ]]; then
     echo "  ✓ debootstrap completed successfully"
 
     echo ""
-    echo "Step 8: Configuring base system..."
+    echo "Step 7: Configuring base system..."
 
     # Copy zpool.cache if it exists
     mkdir -p /mnt/etc/zfs
@@ -1118,7 +1083,7 @@ EOF
     cp /etc/resolv.conf /mnt/etc/resolv.conf
 
     echo ""
-    echo "Step 9: Installing packages in chroot..."
+    echo "Step 8: Installing packages in chroot..."
 
     # Write APT snapshot cleanup script and systemd units to new system before chroot
     # (written here with quoted heredocs to avoid $ escaping inside the chroot heredoc)
@@ -1368,7 +1333,7 @@ EOF
     echo "  ✓ Package installation completed"
 
     echo ""
-    echo "Step 10: Creating user and setting passwords..."
+    echo "Step 9: Creating user and setting passwords..."
 
     # Create user setup script with proper variable expansion
     # NOTE: Using unquoted EOF allows variable expansion (e.g., $USERNAME, $TIMEZONE)
@@ -1414,7 +1379,7 @@ PROFILE_EOF
     echo "  ✓ User setup completed"
 
     echo ""
-    echo "Step 11: Installing ZFSBootMenu..."
+    echo "Step 10: Installing ZFSBootMenu..."
 
     # Install ZFSBootMenu from source in chroot with proper variable expansion
     # NOTE: Using unquoted EOF allows variable expansion (e.g., $DISK, $DISK_EFI)
@@ -1579,15 +1544,15 @@ EOF
     echo "  ✓ ZFSBootMenu installation completed"
 
     echo ""
-    echo "Step 12: Configuring SSH..."
+    echo "Step 11: Configuring SSH..."
     chroot /mnt systemctl enable ssh
 
     echo ""
-    echo "Step 13: Setting ZFS properties for boot..."
+    echo "Step 12: Setting ZFS properties for boot..."
     zpool set bootfs=rpool/ROOT/ubuntu-1 rpool
 
     echo ""
-    echo "Step 14: Verifying installation..."
+    echo "Step 13: Verifying installation..."
 
     # Verify ZFSBootMenu kernel image exists
     if [[ ! -f /mnt/boot/efi/EFI/ZBM/vmlinuz.EFI ]]; then
@@ -1624,7 +1589,7 @@ EOF
     echo "Installation verification complete."
 
     echo ""
-    echo "Step 15: Copying installation script for post-reboot..."
+    echo "Step 14: Copying installation script for post-reboot..."
     INSTALL_DIR="/mnt/home/$USERNAME/zbm-installer"
     mkdir -p "$INSTALL_DIR"
     cp "$0" "$INSTALL_DIR/"
@@ -1655,7 +1620,7 @@ EOF
     cp "$INSTALL_LOG" /mnt/var/log/zbm-install.log 2>/dev/null || true
 
     echo ""
-    echo "Step 16: Unmounting and exporting pool..."
+    echo "Step 15: Unmounting and exporting pool..."
 
     # Kill any processes still using /mnt to prevent busy-mount failures
     fuser -km /mnt 2>/dev/null || true
