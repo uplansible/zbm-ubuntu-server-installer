@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.34
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.35
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -929,7 +929,9 @@ if [[ "$MODE" == "initial" ]]; then
     fi
 
     # Stop ZFS live-system services that conflict with manual pool creation on live ISOs
-    systemctl stop zed zfs-zed zfs-import-scan zfs-import-cache 2>/dev/null || true
+    systemctl stop  zed zfs-zed zfs-import-scan zfs-import-cache 2>/dev/null || true
+    systemctl mask  zed zfs-zed zfs-import-scan zfs-import-cache 2>/dev/null || true
+    pkill -x zed 2>/dev/null || true
 
     # Limit ZFS ARC on low-RAM systems to prevent OOM during debootstrap
     # ZFS ARC defaults to ~50% of RAM; on 2-4GB VMs this leaves too little for debootstrap
@@ -1281,7 +1283,6 @@ Signed-By: /etc/apt/keyrings/docker.asc
 DOCKEREOF
     apt update
     apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    usermod -aG docker "$USERNAME"
     echo "Docker \$(docker --version) installed"
 fi
 
@@ -1339,6 +1340,8 @@ set -euo pipefail
 useradd -m -s /bin/bash -G sudo,adm,cdrom,dip,plugdev "$USERNAME"
 echo "$USERNAME:$USER_PASSWORD" | chpasswd
 echo "User '$USERNAME' created with sudo access."
+# Add to docker group if docker was installed
+getent group docker &>/dev/null && usermod -aG docker "$USERNAME" || true
 
 # Lock root account
 passwd -l root

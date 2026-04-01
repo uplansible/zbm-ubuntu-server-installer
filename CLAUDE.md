@@ -10,7 +10,7 @@ Single file: `zbm-ubuntu-server-installer.sh`
 - Configuration variables are at the top of the script; user is prompted interactively at runtime
 
 ## Key Design Decisions
-- **Monolithic rpool** — single dataset for easy rollback, no zsys
+- **Monolithic rpool** — single dataset for everything (root, /home, /var) for easy rollback and clean unmount on shutdown; no zsys, no sub-datasets
 - **Partition-based layout** — not whole-disk
 - **User is created inside chroot** — `useradd` runs in `/mnt` chroot (Step 10), so the user does NOT exist on the live host system
 - **`chown` on /mnt paths must use numeric UID/GID** — resolve from `/mnt/etc/passwd`, not by username, because the host doesn't know the new user
@@ -46,7 +46,7 @@ Version is in the script header (line 5): `# Ubuntu Server 24.04 ZFSBootMenu Ins
 Increment patch on every push.
 
 ## Current Version
-v3.0.34
+v3.0.35
 
 ## Future Work (not yet implemented)
 - **Mirror / RAIDZ topologies**: Support multi-disk pools (mirror, raidz1, raidz2, raidz3).
