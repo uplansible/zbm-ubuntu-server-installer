@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.22
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.23
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -598,17 +598,21 @@ show_disk_confirmation() {
 ################################################################################
 # MIRROR SPEED SELECTION
 ################################################################################
-# Tests a hardcoded set of well-known Ubuntu mirrors and selects the fastest
-# based on actual download throughput (bytes/sec) via curl+awk.
-# Falls back to the official archive if all tests return zero speed.
-# Note: mirrors.ubuntu.com/mirrors.txt was evaluated but HTTPS times out and
-# HTTP only returns archive.ubuntu.com, so a curated hardcoded list is used.
+# Fetches the GeoIP-filtered mirror list from mirrors.ubuntu.com (HTTP only —
+# HTTPS port 443 is unreachable on that host), then measures actual throughput
+# by downloading the first 100KB of ls-lR.gz from each candidate (technique
+# from Baeldung "Selecting the Fastest Mirror via Command Line in Ubuntu").
+# Falls back to a hardcoded list if the dynamic fetch returns fewer than 2
+# usable mirrors. Uses awk for float comparison (no bc dependency).
 select_fastest_mirror() {
-    local test_path="dists/noble/main/binary-amd64/Packages.gz"
-    local curl_timeout=5
+    # ls-lR.gz lives at the mirror root; -r 0-102400 caps download at ~100KB
+    # so each test completes in ≤2s regardless of file size
+    local test_file="ls-lR.gz"
+    local curl_timeout=2
     local fallback="https://archive.ubuntu.com/ubuntu"
 
-    local -a candidates=(
+    # Hardcoded fallback candidates (used when GeoIP list is unavailable)
+    local -a builtin_candidates=(
         "https://archive.ubuntu.com/ubuntu"
         "https://mirror.init7.net/ubuntu"
         "https://ubuntu.mirror.liteserver.nl/ubuntu"
@@ -618,16 +622,42 @@ select_fastest_mirror() {
     )
 
     echo ""
-    echo "Testing Ubuntu mirrors for download speed..."
+    echo "Fetching regional Ubuntu mirror list..."
+
+    local -a candidates=()
+
+    local raw_list
+    # Use HTTP (not HTTPS) — mirrors.ubuntu.com port 443 times out;
+    # port 80 returns the GeoIP-filtered list correctly
+    if raw_list=$(curl -s --max-time 10 "http://mirrors.ubuntu.com/mirrors.txt" 2>/dev/null) \
+        && [[ -n "$raw_list" ]]; then
+        mapfile -t candidates < <(
+            printf '%s\n' "$raw_list" \
+            | awk '/^https?:\/\// { gsub(/\/$/, ""); print $1 }' \
+            | awk '!seen[$0]++' \
+            | head -n 8
+        )
+        echo "  Retrieved ${#candidates[@]} regional mirrors"
+    else
+        echo "  Could not fetch mirror list, using built-in candidates."
+    fi
+
+    # Fall back to hardcoded list when GeoIP returned nothing useful
+    if (( ${#candidates[@]} < 2 )); then
+        candidates=("${builtin_candidates[@]}")
+        echo "  Using built-in candidate list."
+    fi
+
+    echo "  Testing ${#candidates[@]} mirrors (100KB sample each)..."
 
     local best_mirror=""
     local best_speed="0"
 
     for mirror in "${candidates[@]}"; do
         local speed
-        speed=$(curl -s --max-time "$curl_timeout" -o /dev/null \
+        speed=$(curl -s --max-time "$curl_timeout" -r 0-102400 -o /dev/null \
             -w "%{speed_download}" \
-            "${mirror}/${test_path}" 2>/dev/null) || speed="0"
+            "${mirror}/${test_file}" 2>/dev/null) || speed="0"
         [[ -z "$speed" ]] && speed="0"
 
         local speed_kb
