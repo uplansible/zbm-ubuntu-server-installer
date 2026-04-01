@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.33
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.34
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -965,12 +965,6 @@ if [[ "$MODE" == "initial" ]]; then
     zpool import -N -R /mnt rpool
     zfs mount rpool/ROOT/ubuntu-1
 
-    # Create sub-datasets with tuned properties (before debootstrap populates them)
-    # var/log: disable compression — logs compress poorly and have high write churn
-    zfs create -o canmount=on -o mountpoint=/var         rpool/ROOT/ubuntu-1/var
-    zfs create -o canmount=on -o mountpoint=/var/log \
-               -o compression=off                        rpool/ROOT/ubuntu-1/var/log
-    mkdir -p /mnt/var/log
 
     echo ""
     echo "Step 4: Formatting EFI partition..."
