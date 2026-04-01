@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.24
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.25
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -410,7 +410,7 @@ resolve_part_byid() {
         | while read -r link; do
             [[ "$(readlink -f "$link")" == "$part" ]] && echo "$link"
           done \
-        | grep -v "/wwn-" | sort | head -1)
+        | grep -v "/wwn-" | sort | head -1) || true
     echo "${byid:-$1}"
 }
 
@@ -434,7 +434,7 @@ select_disk() {
             | while read -r link; do
                 [[ "$(readlink -f "$link")" == "/dev/$name" ]] && echo "$link"
               done \
-            | grep -v "/wwn-" | sort | head -1)
+            | grep -v "/wwn-" | sort | head -1) || true
         byid="${byid##*/}"
         names+=("$name")
         sizes+=("$size")
