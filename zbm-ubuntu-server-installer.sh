@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.25
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.30
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -399,19 +399,39 @@ validate_disk_size() {
 # INTERACTIVE DISK AND SIZE SELECTION
 ################################################################################
 
-# Resolve a partition block device to its stable /dev/disk/by-id/ path.
-# Skips wwn- prefixes (prefer ata-/nvme- for readability).
-# Falls back to the raw device path if no by-id symlink is found.
+# Resolve a partition block device to its most stable available path.
+# Priority: /dev/disk/by-id/ (ata-/nvme-, skips wwn-)
+#        -> /dev/disk/by-partuuid/ (works on VMs with virtio disks)
+#        -> raw device path (last resort)
 resolve_part_byid() {
     local part
     part=$(readlink -f "$1")
+
+    # Prefer by-id (physical disks: ata-, nvme-)
     local byid
     byid=$(find /dev/disk/by-id/ -maxdepth 1 -type l 2>/dev/null \
         | while read -r link; do
             [[ "$(readlink -f "$link")" == "$part" ]] && echo "$link"
           done \
         | grep -v "/wwn-" | sort | head -1) || true
-    echo "${byid:-$1}"
+    if [[ -n "$byid" ]]; then
+        echo "$byid"
+        return
+    fi
+
+    # Fall back to by-partuuid (stable on VMs with virtio/paravirtual disks)
+    local bypartuuid
+    bypartuuid=$(find /dev/disk/by-partuuid/ -maxdepth 1 -type l 2>/dev/null \
+        | while read -r link; do
+            [[ "$(readlink -f "$link")" == "$part" ]] && echo "$link"
+          done | head -1) || true
+    if [[ -n "$bypartuuid" ]]; then
+        echo "$bypartuuid"
+        return
+    fi
+
+    # Last resort: raw device path
+    echo "$1"
 }
 
 # Present a numbered list of block devices and let the user choose one.
@@ -916,6 +936,9 @@ if [[ "$MODE" == "initial" ]]; then
     done
     echo "All partitions created successfully."
 
+    # Wait for udev to finish creating /dev/disk/by-partuuid/ symlinks before resolving
+    udevadm settle
+
     # Resolve stable by-id paths for ZFS pool creation
     echo "Resolving partition by-id paths..."
     DISK_RPOOL_ID=$(resolve_part_byid "$DISK_RPOOL")
@@ -1121,8 +1144,11 @@ setupcon --force 2>/dev/null || true
 # Make transient apt errors fatal so stale package lists don't cause silent failures
 echo 'APT::Update::Error-Mode "any";' > /etc/apt/apt.conf.d/30apt_error_on_transient
 
-# Update and install packages
+# Update and upgrade all packages before installing extras
 apt update
+apt dist-upgrade -y
+
+# Install required packages
 apt install -y --no-install-recommends \
     locales \
     linux-generic \
@@ -1437,6 +1463,7 @@ EOF
 
     # Persist installation config so postreboot phase can source it
     cat > "$INSTALL_DIR/zbm-installer.conf" <<EOF
+USERNAME="$USERNAME"
 DISK="$DISK"
 PART_PREFIX="$PART_PREFIX"
 DISK_RPOOL_ID="$DISK_RPOOL_ID"
@@ -1830,8 +1857,8 @@ DOCKEREOF
             exit 1
         fi
 
-        # Use persisted by-id path from initial install, or resolve fresh, or fall back to raw
-        if [[ -z "${DISK_DATAPOOL_ID:-}" ]]; then
+        # Use persisted by-id/by-partuuid path; re-resolve if missing or a raw device path
+        if [[ -z "${DISK_DATAPOOL_ID:-}" ]] || [[ "$DISK_DATAPOOL_ID" != /dev/disk/* ]]; then
             DISK_DATAPOOL_ID=$(resolve_part_byid "$DATAPOOL_PARTITION")
         fi
         echo "  - Using partition: $DISK_DATAPOOL_ID"
