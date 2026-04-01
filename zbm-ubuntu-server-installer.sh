@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.31
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.32
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -1217,11 +1217,15 @@ setupcon --force 2>/dev/null || true
 # Make transient apt errors fatal so stale package lists don't cause silent failures
 echo 'APT::Update::Error-Mode "any";' > /etc/apt/apt.conf.d/30apt_error_on_transient
 
-# Update and upgrade all packages before installing extras
+# Bootstrap: install ca-certificates and curl first so HTTPS mirrors work
+# and curl is available for Docker/Zellij installs later in this script
+apt install -y --no-install-recommends ca-certificates curl
+
+# Update package lists and upgrade base system using the selected mirror
 apt update
 apt dist-upgrade -y
 
-# Install all packages in one pass
+# Install remaining packages
 apt install -y --no-install-recommends \
     locales \
     linux-generic \
@@ -1230,8 +1234,6 @@ apt install -y --no-install-recommends \
     zfs-zed \
     cryptsetup \
     openssh-server \
-    ca-certificates \
-    curl \
     wget \
     vim \
     htop \
