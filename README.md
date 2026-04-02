@@ -73,9 +73,7 @@ Partition 4:  Rest        datapool (created automatically in postreboot if confi
 
 **ZFS Structure:**
 ```
-rpool/ROOT/ubuntu-1        ← Monolithic dataset (root + /home)
-rpool/ROOT/ubuntu-1/var    ← /var (inherits compression)
-rpool/ROOT/ubuntu-1/var/log ← /var/log (compression disabled)
+rpool/ROOT/ubuntu-1        ← Monolithic dataset (root + /home + /var)
 datapool/                  ← Optional separate data pool (configured during install)
   ├── docker
   ├── services
@@ -274,6 +272,32 @@ sudo netplan apply
 ping -c 3 8.8.8.8
 ```
 
+### Dropped to Emergency Shell — "zpool: no such pool" or rpool not found
+
+If ZFS initramfs cannot import `rpool` automatically (e.g. after a failed `postreboot` run
+or unclean shutdown), you will be dropped to a BusyBox / ZFS emergency shell.
+
+```bash
+# Force-import rpool and continue boot
+zpool import -f rpool
+exit
+```
+
+If the pool still won't import, the partition may be visible but the cache stale:
+```bash
+# List available pools
+zpool import
+# Then force-import by name
+zpool import -f rpool
+exit
+```
+
+After the system boots, verify pool health and then reboot cleanly:
+```bash
+sudo zpool status
+sudo reboot
+```
+
 ### ZFSBootMenu Not Appearing
 - Check UEFI boot mode (not legacy BIOS)
 - Verify EFI boot entry: `efibootmgr`
@@ -356,6 +380,11 @@ For issues or questions:
 4. Open an issue on GitHub
 
 ## 🔄 Version History
+
+### Version 3.0.36 (2026-04-02)
+- 🔁 Idempotent `postreboot`: datapool creation and Sanoid config now skip gracefully if already done (safe to run twice)
+- 🔕 Mask `systemd-tpm2-setup-early.service` and `systemd-tpm2-setup.service` in chroot — eliminates boot FAILED noise on systems without TPM2
+- 🐛 Fixed emergency ZFS shell on reboot caused by ERR trap exporting the datapool when `postreboot` was run a second time
 
 ### Version 3.0.4 (2026-03-03)
 - 📄 Added MIT license file

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.35
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.36
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -1263,6 +1263,9 @@ systemctl enable cleanup-apt-snapshots.timer
 systemctl enable systemd-timesyncd
 systemctl enable zfs-zed
 
+# Mask TPM2 setup services — not used by ZFSBootMenu; avoids boot FAILED noise
+systemctl mask systemd-tpm2-setup-early.service systemd-tpm2-setup.service
+
 # Take initial snapshot
 sanoid --take-snapshots --verbose
 
@@ -1768,26 +1771,33 @@ elif [[ "$MODE" == "postreboot" ]]; then
         echo "  - Creating mount point: $DATAPOOL_MOUNTPOINT"
         mkdir -p "$DATAPOOL_MOUNTPOINT"
 
-        # Create the pool
+        # Create the pool (idempotent: skip if already imported)
         echo "  - Creating ZFS pool: $DATAPOOL_NAME"
-        zpool create -o ashift=$ASHIFT \
-                     -O compression=${COMPRESSION} \
-                     -O atime=$ZFS_ATIME \
-                     -O mountpoint="$DATAPOOL_MOUNTPOINT" \
-                     "$DATAPOOL_NAME" "$DISK_DATAPOOL_ID"
+        if zpool list "$DATAPOOL_NAME" &>/dev/null; then
+            echo "  ✓ Datapool '$DATAPOOL_NAME' already imported, skipping creation"
+        else
+            zpool create -o ashift=$ASHIFT \
+                         -O compression=${COMPRESSION} \
+                         -O atime=$ZFS_ATIME \
+                         -O mountpoint="$DATAPOOL_MOUNTPOINT" \
+                         "$DATAPOOL_NAME" "$DISK_DATAPOOL_ID"
+            echo "  ✓ Datapool '$DATAPOOL_NAME' created and mounted at $DATAPOOL_MOUNTPOINT"
+        fi
 
-        echo "  ✓ Datapool '$DATAPOOL_NAME' created and mounted at $DATAPOOL_MOUNTPOINT"
-
-        # Add to Sanoid config
+        # Add to Sanoid config (idempotent: skip if section already present)
         echo ""
-        echo "  - Adding datapool to Sanoid configuration..."
-        cat >> /etc/sanoid/sanoid.conf << EOF
+        if ! grep -q "^\[$DATAPOOL_NAME\]" /etc/sanoid/sanoid.conf; then
+            echo "  - Adding datapool to Sanoid configuration..."
+            cat >> /etc/sanoid/sanoid.conf << EOF
 
 [$DATAPOOL_NAME]
     use_template = template_production
     recursive = yes
 EOF
-        echo "  ✓ Sanoid configured for $DATAPOOL_NAME"
+            echo "  ✓ Sanoid configured for $DATAPOOL_NAME"
+        else
+            echo "  ✓ Sanoid already configured for $DATAPOOL_NAME, skipping"
+        fi
     else
         echo ""
         echo "Step 2: Skipping datapool creation (DATAPOOL_NAME not set)"
