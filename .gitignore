@@ -1,1 +1,22 @@
+# Local/private project files
+CLAUDE.md
+
+# Claude Code
+.claude/
+
+# Zed editor
+.zed/
+
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Vim swap files
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Git submodule
 ubuntu-server-zfsbootmenu/
