@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.36
+# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.38
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -42,7 +42,6 @@ APT_MIRROR="https://archive.ubuntu.com/ubuntu"
 
 # Optional datapool configuration (set to empty string to skip)
 DATAPOOL_NAME="ssdupl"                 # Name of the datapool (leave empty to skip auto-creation)
-DATAPOOL_MOUNTPOINT="/mnt/ssdupl"      # Where to mount the datapool
 
 # Optional software
 INSTALL_ZELLIJ="y"   # Install Zellij terminal multiplexer (y/n)
@@ -330,26 +329,16 @@ validate_inputs() {
         fi
     fi
 
+    # Derive datapool mountpoint from pool name
+    if [[ -n "$DATAPOOL_NAME" ]]; then
+        DATAPOOL_MOUNTPOINT="/$DATAPOOL_NAME"
+    fi
+
     # Validate COMPRESSION
     if [[ ! "$COMPRESSION" =~ ^(lz4|zstd|gzip|none)$ ]]; then
         echo "Error: Invalid COMPRESSION '$COMPRESSION'. Must be one of: lz4, zstd, gzip, none"
         exit 1
     fi
-
-    # Validate DATAPOOL_MOUNTPOINT if DATAPOOL_NAME is set
-    if [[ -n "$DATAPOOL_NAME" ]]; then
-        if [[ "$DATAPOOL_MOUNTPOINT" != /* ]]; then
-            echo "Error: DATAPOOL_MOUNTPOINT must be an absolute path (got: $DATAPOOL_MOUNTPOINT)"
-            exit 1
-        fi
-        if [[ "$DATAPOOL_MOUNTPOINT" == "/" ]]; then
-            echo "Error: DATAPOOL_MOUNTPOINT cannot be /"
-            exit 1
-        fi
-        if [[ -d "$DATAPOOL_MOUNTPOINT" ]] && [[ -n "$(ls -A "$DATAPOOL_MOUNTPOINT" 2>/dev/null)" ]]; then
-            echo "Warning: DATAPOOL_MOUNTPOINT '$DATAPOOL_MOUNTPOINT' already exists and is non-empty!"
-            echo "Mounting a ZFS pool here will shadow existing contents."
-        fi
     fi
 }
 
@@ -913,6 +902,25 @@ if [[ "$MODE" == "initial" ]]; then
         echo "  datapool: $DISK_DATAPOOL_ID"
     fi
 
+    # Stop and mask ALL ZFS live-system services BEFORE touching disks.
+    # wipefs/zpool labelclear fire udev events; zed reacts to device changes
+    # and can ABRT if it races against pool creation on the same partitions.
+    # Also include zfs-mount, zfs-share, zfs-import-bpool which Ubuntu 24.04
+    # live ISO may have active in addition to the core import/scan services.
+    systemctl stop  zed zfs-zed zfs-import-scan zfs-import-cache zfs-mount zfs-share zfs-import-bpool 2>/dev/null || true
+    systemctl mask  zed zfs-zed zfs-import-scan zfs-import-cache zfs-mount zfs-share zfs-import-bpool 2>/dev/null || true
+    pkill -x zed 2>/dev/null || true
+    sleep 1  # let services fully terminate before udev events from wipefs
+
+    # Limit ZFS ARC on low-RAM systems to prevent OOM during debootstrap.
+    # Set before any ZFS operations so the cap is in effect from the start.
+    # ZFS ARC defaults to ~50% of RAM; on 2-4GB VMs this leaves too little for debootstrap.
+    total_ram_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    if [[ $total_ram_kb -le 4194304 ]]; then
+        echo 536870912 > /sys/module/zfs/parameters/zfs_arc_max
+        echo "  ZFS ARC capped at 512MB (<=4GB RAM detected)"
+    fi
+
     # Wipe any existing filesystem signatures and ZFS labels
     echo "Clearing filesystem signatures..."
     wipefs -a "$DISK_EFI" 2>/dev/null || true
@@ -926,19 +934,6 @@ if [[ "$MODE" == "initial" ]]; then
     zpool labelclear -f "$DISK_RPOOL" 2>/dev/null || true
     if [[ -n "$DATAPOOL_NAME" ]]; then
         zpool labelclear -f "$DISK_DATAPOOL" 2>/dev/null || true
-    fi
-
-    # Stop ZFS live-system services that conflict with manual pool creation on live ISOs
-    systemctl stop  zed zfs-zed zfs-import-scan zfs-import-cache 2>/dev/null || true
-    systemctl mask  zed zfs-zed zfs-import-scan zfs-import-cache 2>/dev/null || true
-    pkill -x zed 2>/dev/null || true
-
-    # Limit ZFS ARC on low-RAM systems to prevent OOM during debootstrap
-    # ZFS ARC defaults to ~50% of RAM; on 2-4GB VMs this leaves too little for debootstrap
-    total_ram_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-    if [[ $total_ram_kb -le 4194304 ]]; then
-        echo 536870912 > /sys/module/zfs/parameters/zfs_arc_max
-        echo "  ZFS ARC capped at 512MB (<=4GB RAM detected)"
     fi
 
     echo ""
@@ -1798,6 +1793,63 @@ EOF
         else
             echo "  ✓ Sanoid already configured for $DATAPOOL_NAME, skipping"
         fi
+
+        # Create Docker datasets and configure daemon.json (idempotent)
+        if [[ "$INSTALL_DOCKER" == "y" ]]; then
+            echo ""
+            if ! zpool list "$DATAPOOL_NAME" &>/dev/null; then
+                echo "  ⚠ Datapool '$DATAPOOL_NAME' not available — skipping Docker dataset/config setup"
+            else
+                echo "  - Creating Docker datasets under $DATAPOOL_NAME/docker..."
+
+                # Parent dataset — inherits pool compression/atime
+                zfs list "$DATAPOOL_NAME/docker" &>/dev/null || \
+                    zfs create "$DATAPOOL_NAME/docker"
+
+                # dockerroot: Docker's data-root (overlay2 layers, images, containers)
+                #   recordsize=16K   — overlay2 writes in small blocks
+                #   xattr=sa         — required for overlay2
+                #   acltype=posixacl — required for overlay2
+                zfs list "$DATAPOOL_NAME/docker/dockerroot" &>/dev/null || \
+                    zfs create \
+                        -o recordsize=16K \
+                        -o xattr=sa \
+                        -o acltype=posixacl \
+                        "$DATAPOOL_NAME/docker/dockerroot"
+
+                # storage: external volume data mounted into containers
+                #   default recordsize (128K) suits mixed file sizes
+                zfs list "$DATAPOOL_NAME/docker/storage" &>/dev/null || \
+                    zfs create "$DATAPOOL_NAME/docker/storage"
+
+                # stack: docker-compose files (small text files)
+                #   recordsize=4K — minimises wasted space for tiny config files
+                zfs list "$DATAPOOL_NAME/docker/stack" &>/dev/null || \
+                    zfs create \
+                        -o recordsize=4K \
+                        "$DATAPOOL_NAME/docker/stack"
+
+                echo "  ✓ Docker datasets created"
+
+                # Point Docker data-root at the ZFS dataset (idempotent)
+                DOCKER_ROOT="$DATAPOOL_MOUNTPOINT/docker/dockerroot"
+                DAEMON_JSON="/etc/docker/daemon.json"
+                if [[ ! -f "$DAEMON_JSON" ]] || ! grep -q "data-root" "$DAEMON_JSON"; then
+                    echo "  - Configuring Docker data-root → $DOCKER_ROOT"
+                    mkdir -p /etc/docker
+                    cat > "$DAEMON_JSON" << DOCKEREOF
+{
+    "data-root": "$DOCKER_ROOT",
+    "storage-driver": "overlay2"
+}
+DOCKEREOF
+                    systemctl restart docker
+                    echo "  ✓ Docker data-root set to $DOCKER_ROOT"
+                else
+                    echo "  ✓ Docker daemon.json already configured, skipping"
+                fi
+            fi
+        fi
     else
         echo ""
         echo "Step 2: Skipping datapool creation (DATAPOOL_NAME not set)"
@@ -1823,9 +1875,14 @@ EOF
     echo "Next steps:"
     echo "  1. Use 'passwd' to change your password if needed"
     if [[ -n "$DATAPOOL_NAME" ]]; then
-        echo "  2. Create datasets in $DATAPOOL_NAME as needed:"
-        echo "     zfs create $DATAPOOL_NAME/docker"
-        echo "     zfs create $DATAPOOL_NAME/services"
+        if [[ "$INSTALL_DOCKER" == "y" ]]; then
+            echo "  2. Docker datasets created automatically:"
+            echo "       $DATAPOOL_NAME/docker/dockerroot  ← Docker data-root (images, containers)"
+            echo "       $DATAPOOL_NAME/docker/storage     ← External container data"
+            echo "       $DATAPOOL_NAME/docker/stack       ← Docker Compose project files"
+        else
+            echo "  2. Create datasets in $DATAPOOL_NAME as needed (e.g. zfs create $DATAPOOL_NAME/data)"
+        fi
     else
         echo "  2. Create your datapool manually when ready:"
         echo "     First, identify your datapool partition with: ls /dev/disk/by-id/ | grep part4"
