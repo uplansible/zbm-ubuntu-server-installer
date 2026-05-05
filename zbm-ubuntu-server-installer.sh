@@ -2,11 +2,10 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 24.04 ZFSBootMenu Installation Script v3.0.38
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.39
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
-# - No zsys
 # - Manual datapool creation later
 ################################################################################
 
@@ -339,7 +338,6 @@ validate_inputs() {
         echo "Error: Invalid COMPRESSION '$COMPRESSION'. Must be one of: lz4, zstd, gzip, none"
         exit 1
     fi
-    fi
 }
 
 validate_disk_size() {
@@ -451,6 +449,127 @@ select_disk() {
 
     DISK="/dev/${names[$((choice - 1))]}"
     echo "Selected disk: $DISK (${sizes[$((choice - 1))]})"
+}
+
+# Interactively select datapool topology and (for multi-disk) the member disks.
+# Reads: DISK (install disk to exclude)
+# Sets: DATAPOOL_TOPOLOGY  (single / mirror / raidz1 / raidz2 / raidz3)
+#       DATAPOOL_DISK_IDS  (array of by-id/by-partuuid paths; empty for single)
+select_datapool_topology_and_disks() {
+    # Collect whole block devices that are NOT the install disk
+    local -a extra_names extra_sizes extra_models
+    while IFS= read -r line; do
+        local name size model
+        name=$(awk '{print $1}' <<< "$line")
+        size=$(awk '{print $2}' <<< "$line")
+        model=$(awk '{$1=$2=""; print $0}' <<< "$line" | sed 's/^ *//')
+        [[ "/dev/$name" == "$DISK" ]] && continue
+        extra_names+=("$name")
+        extra_sizes+=("$size")
+        extra_models+=("$model")
+    done < <(lsblk -d -o NAME,SIZE,MODEL --noheadings | grep -v '^loop\|^sr')
+
+    local n_extra=${#extra_names[@]}
+
+    # Build list of valid topologies based on available disk count
+    local -a topo_labels topo_values
+    topo_labels+=("single  – partition 4 of install disk (no extra disks needed)")
+    topo_values+=("single")
+    if [[ $n_extra -ge 2 ]]; then
+        topo_labels+=("mirror  – 2 whole disks (mirrored redundancy)")
+        topo_values+=("mirror")
+        topo_labels+=("raidz1  – 2+ whole disks (single-parity)")
+        topo_values+=("raidz1")
+    fi
+    if [[ $n_extra -ge 3 ]]; then
+        topo_labels+=("raidz2  – 3+ whole disks (double-parity)")
+        topo_values+=("raidz2")
+    fi
+    if [[ $n_extra -ge 4 ]]; then
+        topo_labels+=("raidz3  – 4+ whole disks (triple-parity)")
+        topo_values+=("raidz3")
+    fi
+
+    echo ""
+    echo "======================================================================"
+    printf "Datapool topology (%d extra disk(s) found):\n" "$n_extra"
+    echo "======================================================================"
+    local i
+    for i in "${!topo_labels[@]}"; do
+        printf "  [%d] %s\n" "$((i+1))" "${topo_labels[$i]}"
+    done
+    echo ""
+
+    local topo_choice
+    while true; do
+        read -rp "Select topology [1-${#topo_labels[@]}]: " topo_choice
+        if [[ "$topo_choice" =~ ^[0-9]+$ ]] && \
+           [[ "$topo_choice" -ge 1 ]] && [[ "$topo_choice" -le ${#topo_labels[@]} ]]; then
+            break
+        fi
+        echo "Invalid selection."
+    done
+
+    DATAPOOL_TOPOLOGY="${topo_values[$((topo_choice-1))]}"
+    DATAPOOL_DISK_IDS=()
+
+    [[ "$DATAPOOL_TOPOLOGY" == "single" ]] && return
+
+    # Determine minimum disk count for the chosen topology
+    local min_disks
+    case "$DATAPOOL_TOPOLOGY" in
+        mirror|raidz1) min_disks=2 ;;
+        raidz2)        min_disks=3 ;;
+        raidz3)        min_disks=4 ;;
+    esac
+
+    echo ""
+    echo "Select at least $min_disks disk(s) for the $DATAPOOL_TOPOLOGY pool."
+    echo "(Install disk $DISK is excluded.)"
+
+    local -a selected_devs
+    local count=0
+
+    while true; do
+        echo ""
+        echo "Available extra disks:"
+        for i in "${!extra_names[@]}"; do
+            printf "  [%d] /dev/%-10s  %-8s  %s\n" \
+                "$((i+1))" "${extra_names[$i]}" "${extra_sizes[$i]}" "${extra_models[$i]}"
+        done
+        echo ""
+
+        if [[ $count -ge $min_disks ]]; then
+            local more
+            read -rp "Add another disk? [y/N]: " more
+            [[ ! "$more" =~ ^[Yy]$ ]] && break
+        fi
+
+        local choice
+        while true; do
+            read -rp "Select disk number [1-${#extra_names[@]}]: " choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && \
+               [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#extra_names[@]} ]]; then
+                local dev="/dev/${extra_names[$((choice-1))]}"
+                if [[ " ${selected_devs[*]} " == *" $dev "* ]]; then
+                    echo "Already selected. Choose a different disk."
+                else
+                    break
+                fi
+            else
+                echo "Invalid selection."
+            fi
+        done
+
+        local chosen_dev="/dev/${extra_names[$((choice-1))]}"
+        selected_devs+=("$chosen_dev")
+        DATAPOOL_DISK_IDS+=("$(resolve_part_byid "$chosen_dev")")
+        count=$((count+1))
+        echo "  + Added: $chosen_dev (${extra_sizes[$((choice-1))]})"
+    done
+
+    echo ""
+    echo "Selected $DATAPOOL_TOPOLOGY disks: ${selected_devs[*]}"
 }
 
 # Show a breakdown of available space and prompt for rpool percentage.
@@ -784,7 +903,7 @@ if [[ "$MODE" == "initial" ]]; then
     echo "Installation log: $INSTALL_LOG"
 
     echo "======================================================================"
-    echo "Starting Ubuntu 24.04 ZFSBootMenu Installation"
+    echo "Starting Ubuntu 26.04 ZFSBootMenu Installation"
     echo "======================================================================"
 
     echo ""
@@ -905,7 +1024,7 @@ if [[ "$MODE" == "initial" ]]; then
     # Stop and mask ALL ZFS live-system services BEFORE touching disks.
     # wipefs/zpool labelclear fire udev events; zed reacts to device changes
     # and can ABRT if it races against pool creation on the same partitions.
-    # Also include zfs-mount, zfs-share, zfs-import-bpool which Ubuntu 24.04
+    # Also include zfs-mount, zfs-share, zfs-import-bpool which Ubuntu 26.04
     # live ISO may have active in addition to the core import/scan services.
     systemctl stop  zed zfs-zed zfs-import-scan zfs-import-cache zfs-mount zfs-share zfs-import-bpool 2>/dev/null || true
     systemctl mask  zed zfs-zed zfs-import-scan zfs-import-cache zfs-mount zfs-share zfs-import-bpool 2>/dev/null || true
@@ -979,7 +1098,7 @@ if [[ "$MODE" == "initial" ]]; then
 
     echo ""
     echo "Step 6: Installing Ubuntu base system..."
-    debootstrap noble /mnt "$APT_MIRROR"
+    debootstrap resolute /mnt "$APT_MIRROR"
 
     # Verify debootstrap succeeded
     echo "Verifying debootstrap installation..."
@@ -1033,9 +1152,9 @@ EOF
 
     # Configure apt sources (using selected mirror; security always via official archive)
     cat > /mnt/etc/apt/sources.list << EOF
-deb $APT_MIRROR noble main restricted universe multiverse
-deb $APT_MIRROR noble-updates main restricted universe multiverse
-deb https://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
+deb $APT_MIRROR resolute main restricted universe multiverse
+deb $APT_MIRROR resolute-updates main restricted universe multiverse
+deb https://security.ubuntu.com/ubuntu resolute-security main restricted universe multiverse
 EOF
 
     # Configure basic network (DHCP on all interfaces)
@@ -1739,44 +1858,45 @@ elif [[ "$MODE" == "postreboot" ]]; then
         echo ""
         echo "Step 2: Creating datapool '$DATAPOOL_NAME'..."
 
-        # Detect partition naming
-        if [[ "$DISK" =~ nvme|mmcblk|loop ]]; then
-            PART_PREFIX="p"
-        else
-            PART_PREFIX=""
-        fi
-        DATAPOOL_PARTITION="${DISK}${PART_PREFIX}4"
-
-        # Partition type is already BF00 (set during initial install)
-        # Verify partition exists
-        if [[ ! -b "$DATAPOOL_PARTITION" ]]; then
-            echo "Error: Datapool partition $DATAPOOL_PARTITION not found!"
-            echo "Available partitions:"
-            lsblk "$DISK" || true
-            exit 1
-        fi
-
-        # Use persisted by-id/by-partuuid path; re-resolve if missing or a raw device path
-        if [[ -z "${DISK_DATAPOOL_ID:-}" ]] || [[ "$DISK_DATAPOOL_ID" != /dev/disk/* ]]; then
-            DISK_DATAPOOL_ID=$(resolve_part_byid "$DATAPOOL_PARTITION")
-        fi
-        echo "  - Using partition: $DISK_DATAPOOL_ID"
+        # Select topology interactively; sets DATAPOOL_TOPOLOGY and DATAPOOL_DISK_IDS
+        select_datapool_topology_and_disks
 
         # Create mount point
         echo "  - Creating mount point: $DATAPOOL_MOUNTPOINT"
         mkdir -p "$DATAPOOL_MOUNTPOINT"
 
         # Create the pool (idempotent: skip if already imported)
-        echo "  - Creating ZFS pool: $DATAPOOL_NAME"
+        echo "  - Creating ZFS pool: $DATAPOOL_NAME ($DATAPOOL_TOPOLOGY)"
         if zpool list "$DATAPOOL_NAME" &>/dev/null; then
             echo "  ✓ Datapool '$DATAPOOL_NAME' already imported, skipping creation"
-        else
+        elif [[ "$DATAPOOL_TOPOLOGY" == "single" ]]; then
+            # Use partition 4 of the install disk (existing behaviour)
+            if [[ "$DISK" =~ nvme|mmcblk|loop ]]; then PART_PREFIX="p"; else PART_PREFIX=""; fi
+            DATAPOOL_PARTITION="${DISK}${PART_PREFIX}4"
+            if [[ ! -b "$DATAPOOL_PARTITION" ]]; then
+                echo "Error: Datapool partition $DATAPOOL_PARTITION not found!"
+                lsblk "$DISK" || true
+                exit 1
+            fi
+            if [[ -z "${DISK_DATAPOOL_ID:-}" ]] || [[ "$DISK_DATAPOOL_ID" != /dev/disk/* ]]; then
+                DISK_DATAPOOL_ID=$(resolve_part_byid "$DATAPOOL_PARTITION")
+            fi
+            echo "  - Using partition: $DISK_DATAPOOL_ID"
             zpool create -o ashift=$ASHIFT \
                          -O compression=${COMPRESSION} \
                          -O atime=$ZFS_ATIME \
                          -O mountpoint="$DATAPOOL_MOUNTPOINT" \
                          "$DATAPOOL_NAME" "$DISK_DATAPOOL_ID"
-            echo "  ✓ Datapool '$DATAPOOL_NAME' created and mounted at $DATAPOOL_MOUNTPOINT"
+            echo "  ✓ Datapool '$DATAPOOL_NAME' (single) created at $DATAPOOL_MOUNTPOINT"
+        else
+            # Multi-disk topology: use whole disks selected interactively
+            echo "  - Disks: ${DATAPOOL_DISK_IDS[*]}"
+            zpool create -o ashift=$ASHIFT \
+                         -O compression=${COMPRESSION} \
+                         -O atime=$ZFS_ATIME \
+                         -O mountpoint="$DATAPOOL_MOUNTPOINT" \
+                         "$DATAPOOL_NAME" "$DATAPOOL_TOPOLOGY" "${DATAPOOL_DISK_IDS[@]}"
+            echo "  ✓ Datapool '$DATAPOOL_NAME' ($DATAPOOL_TOPOLOGY) created at $DATAPOOL_MOUNTPOINT"
         fi
 
         # Add to Sanoid config (idempotent: skip if section already present)
