@@ -1,10 +1,10 @@
-# Ubuntu 24.04 ZFSBootMenu Server Installation
+# Ubuntu 26.04 ZFSBootMenu Server Installation
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Ubuntu 24.04](https://img.shields.io/badge/Ubuntu-24.04%20LTS-orange.svg)](https://ubuntu.com)
+[![Ubuntu 26.04](https://img.shields.io/badge/Ubuntu-26.04%20LTS-orange.svg)](https://ubuntu.com)
 [![ZFS](https://img.shields.io/badge/ZFS-OpenZFS-blue.svg)](https://openzfs.org)
 
-Automated installation script for Ubuntu 24.04 Server with ZFS root filesystem and ZFSBootMenu bootloader. Features a monolithic ZFS architecture optimized for easy snapshots and system rollbacks.
+Automated installation script for Ubuntu 26.04 Server with ZFS root filesystem and ZFSBootMenu bootloader. Features a monolithic ZFS architecture optimized for easy snapshots and system rollbacks.
 
 > **Disclaimer:** This script is provided "as is", without warranty of any kind, express or implied. Use at your own risk. The author accepts no responsibility for data loss, system damage, or any other issues arising from use of this script. **Always back up your data before proceeding.**
 
@@ -19,14 +19,14 @@ Automated installation script for Ubuntu 24.04 Server with ZFS root filesystem a
 ## 📋 Quick Start
 
 ### Requirements
-- Ubuntu 24.04 Live USB
+- Ubuntu 26.04 Live USB
 - Target disk with at least 90GB (default: 1GB EFI + swap sized to RAM + 80% of remaining for rpool)
 - Internet connection
 - UEFI boot mode (required for ZFSBootMenu)
 
 ### Installation (5 minutes + download time)
 
-1. **Boot Ubuntu 24.04 Live USB**
+1. **Boot Ubuntu 26.04 Live USB**
 
 2. **Download and run:**
 
@@ -380,6 +380,13 @@ For issues or questions:
 4. Open an issue on GitHub
 
 ## 🔄 Version History
+
+### Version 3.0.40 (2026-05-06)
+- 🔒 User password no longer written to disk — set via `chpasswd` stdin pipe after chroot; safe for all metacharacters
+- 🛡️ Swap-size prompt validates numeric input before arithmetic expansion — non-numeric entry re-prompts instead of aborting
+- 🐛 Locale search uses fixed-string grep (`-F`) — prevents regex metacharacters from crashing the search
+- 🐛 Fixed invalid `cleanup-apt-snapshots.timer` `OnCalendar` expression — split into two valid lines so the timer loads correctly
+- 🔁 ZFSBootMenu git clone is now idempotent — source directory is wiped before cloning, fixing `reinstall-zbm` mode
 
 ### Version 3.0.36 (2026-04-02)
 - 🔁 Idempotent `postreboot`: datapool creation and Sanoid config now skip gracefully if already done (safe to run twice)

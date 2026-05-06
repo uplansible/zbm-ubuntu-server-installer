@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.39
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.40
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -41,6 +41,10 @@ APT_MIRROR="https://archive.ubuntu.com/ubuntu"
 
 # Optional datapool configuration (set to empty string to skip)
 DATAPOOL_NAME="ssdupl"                 # Name of the datapool (leave empty to skip auto-creation)
+DATAPOOL_MOUNTPOINT=""                 # Derived from DATAPOOL_NAME in validate_inputs(); initialised here so set -u never fires
+DISK_DATAPOOL_ID=""                    # Resolved after partition creation; empty when DATAPOOL_NAME=""
+DATAPOOL_TOPOLOGY=""                   # Set by select_datapool_topology_and_disks()
+DATAPOOL_DISK_IDS=()
 
 # Optional software
 INSTALL_ZELLIJ="y"   # Install Zellij terminal multiplexer (y/n)
@@ -74,7 +78,7 @@ select_locale() {
 
         # Search: extract first field (locale name), filter by term (case-insensitive)
         local -a results
-        mapfile -t results < <(grep -i "$term" "$supported_file" | awk '{print $1}' | grep -v '^#')
+        mapfile -t results < <(grep -Fi "$term" "$supported_file" | awk '{print $1}' | grep -v '^#')
 
         if [[ ${#results[@]} -eq 0 ]]; then
             echo "  No locales found matching '$term'. Try again."
@@ -171,10 +175,17 @@ configure_interactively() {
         suggested_swap_gib=8
     fi
     SWAP_SIZE=$(( suggested_swap_gib * 1024 ))
-    read -rp "Swap size in GiB (detected RAM: ${ram_gb}GiB, suggested: ${suggested_swap_gib}GiB) [${suggested_swap_gib}]: " input
-    if [[ -n "$input" ]]; then
-        SWAP_SIZE=$(( input * 1024 ))
-    fi
+    while true; do
+        read -rp "Swap size in GiB (detected RAM: ${ram_gb}GiB, suggested: ${suggested_swap_gib}GiB) [${suggested_swap_gib}]: " input
+        if [[ -z "$input" ]]; then
+            break
+        elif [[ ! "$input" =~ ^[0-9]+$ ]]; then
+            echo "  Error: swap size must be a non-negative integer (GiB). Try again."
+        else
+            SWAP_SIZE=$(( input * 1024 ))
+            break
+        fi
+    done
 
     # Locale (interactive search)
     echo ""
@@ -386,7 +397,7 @@ resolve_part_byid() {
         return
     fi
 
-    # Fall back to by-partuuid (stable on VMs with virtio/paravirtual disks)
+    # by-partuuid — stable for partitions on VMs (virtio, paravirtual); preferred over by-path for partitions
     local bypartuuid
     bypartuuid=$(find /dev/disk/by-partuuid/ -maxdepth 1 -type l 2>/dev/null \
         | while read -r link; do
@@ -394,6 +405,18 @@ resolve_part_byid() {
           done | head -1) || true
     if [[ -n "$bypartuuid" ]]; then
         echo "$bypartuuid"
+        return
+    fi
+
+    # by-path — stable for whole disks on VMs where by-id has no serial
+    # grep -v "part" keeps only whole-disk links (not partition sub-links)
+    local bypath
+    bypath=$(find /dev/disk/by-path/ -maxdepth 1 -type l 2>/dev/null \
+        | while read -r link; do
+            [[ "$(readlink -f "$link")" == "$part" ]] && echo "$link"
+          done | grep -v "part" | sort | head -1) || true
+    if [[ -n "$bypath" ]]; then
+        echo "$bypath"
         return
     fi
 
@@ -1073,8 +1096,9 @@ if [[ "$MODE" == "initial" ]]; then
         rpool "$DISK_RPOOL_ID"
 
     # Create single monolithic root dataset
-    zfs create -o canmount=noauto -o mountpoint=/ rpool/ROOT
-    zfs create -o mountpoint=/ rpool/ROOT/ubuntu-1
+    # Parent must be inert (canmount=off, mountpoint=none); only the child boots from /
+    zfs create -o canmount=off -o mountpoint=none rpool/ROOT
+    zfs create -o canmount=noauto -o mountpoint=/ rpool/ROOT/ubuntu-1
 
     # Mount root
     zpool export rpool
@@ -1134,8 +1158,10 @@ UUID=$DISK_EFI_UUID  /boot/efi       vfat      defaults    0 1
 EOF
 
     # Configure encrypted swap with a random ephemeral key per boot
+    # Use PARTUUID so the entry survives disk enumeration changes across reboots
+    SWAP_PARTUUID=$(blkid -s PARTUUID -o value "$DISK_SWAP")
     cat > /mnt/etc/crypttab << EOF
-swap  $DISK_SWAP  /dev/urandom  plain,swap,cipher=aes-xts-plain64:sha256,size=512
+swap  PARTUUID=$SWAP_PARTUUID  /dev/urandom  plain,swap,cipher=aes-xts-plain64:sha256,size=512
 EOF
 
     # Set hostname
@@ -1260,7 +1286,8 @@ Description=Twice-daily cleanup of old APT ZFS snapshots
 Documentation=man:zfs(8)
 
 [Timer]
-OnCalendar=*-*-* 00,12:00:00
+OnCalendar=*-*-* 00:00:00
+OnCalendar=*-*-* 12:00:00
 Persistent=true
 
 [Install]
@@ -1455,7 +1482,6 @@ set -euo pipefail
 
 # Create user with sudo access and standard Ubuntu groups
 useradd -m -s /bin/bash -G sudo,adm,cdrom,dip,plugdev "$USERNAME"
-echo "$USERNAME:$USER_PASSWORD" | chpasswd
 echo "User '$USERNAME' created with sudo access."
 # Add to docker group if docker was installed
 getent group docker &>/dev/null && usermod -aG docker "$USERNAME" || true
@@ -1480,11 +1506,15 @@ EOF
         exit 1
     fi
     rm /mnt/tmp/user-setup.sh
+    # Set password via stdin — never written to disk, safe for all metacharacters
+    printf '%s:%s\n' "$USERNAME" "$USER_PASSWORD" | chroot /mnt chpasswd
 
     # Tabby SFTP integration: notify terminal of current directory on each prompt
     # Written directly (not via chroot heredoc) to avoid quoting/expansion issues
     cat >> "/mnt/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
-export PS1="$PS1\[\e]1337;CurrentDir="'$(pwd)\a\]'
+if [[ "$TERM_PROGRAM" == "Tabby" ]] || command -v tabby >/dev/null 2>&1; then
+    PS1="${PS1}\[\e]1337;CurrentDir=\w\a\]"
+fi
 PROFILE_EOF
     # Resolve UID/GID from installed system (user doesn't exist on live host)
     TARGET_UID=$(grep "^$USERNAME:" /mnt/etc/passwd | cut -d: -f3)
@@ -1527,6 +1557,7 @@ apt install -y --no-install-recommends \\
 
 # Download and compile ZFSBootMenu from source
 echo "Downloading ZFSBootMenu from GitHub..."
+rm -rf /usr/local/src/zfsbootmenu
 mkdir -p /usr/local/src/zfsbootmenu
 cd /usr/local/src/zfsbootmenu
 
@@ -1641,6 +1672,15 @@ generate-zbm --debug
 echo "ZFSBootMenu updated successfully"
 WRAPPER_EOF
 chmod +x /usr/local/bin/update-zbm
+
+# Drop a kernel postinst hook so dpkg triggers ZBM regeneration after every kernel upgrade
+mkdir -p /etc/kernel/postinst.d
+cat > /etc/kernel/postinst.d/99-update-zbm << 'HOOK_EOF'
+#!/bin/sh
+set -e
+/usr/local/bin/update-zbm
+HOOK_EOF
+chmod +x /etc/kernel/postinst.d/99-update-zbm
 
 echo "ZFSBootMenu installation complete"
 
@@ -1878,9 +1918,7 @@ elif [[ "$MODE" == "postreboot" ]]; then
                 lsblk "$DISK" || true
                 exit 1
             fi
-            if [[ -z "${DISK_DATAPOOL_ID:-}" ]] || [[ "$DISK_DATAPOOL_ID" != /dev/disk/* ]]; then
-                DISK_DATAPOOL_ID=$(resolve_part_byid "$DATAPOOL_PARTITION")
-            fi
+            DISK_DATAPOOL_ID=$(resolve_part_byid "$DATAPOOL_PARTITION")
             echo "  - Using partition: $DISK_DATAPOOL_ID"
             zpool create -o ashift=$ASHIFT \
                          -O compression=${COMPRESSION} \
@@ -1891,6 +1929,28 @@ elif [[ "$MODE" == "postreboot" ]]; then
         else
             # Multi-disk topology: use whole disks selected interactively
             echo "  - Disks: ${DATAPOOL_DISK_IDS[*]}"
+
+            # Validate each resolved path is a block device
+            for _id in "${DATAPOOL_DISK_IDS[@]}"; do
+                if [[ ! -b "$_id" ]]; then
+                    echo "Error: Disk path not found: $_id"
+                    exit 1
+                fi
+            done
+
+            # Check for existing ZFS labels that would cause zpool create to refuse
+            for _id in "${DATAPOOL_DISK_IDS[@]}"; do
+                if zpool import -d "$_id" 2>/dev/null | grep -q "pool:"; then
+                    read -rp "  Disk $_id has an existing ZFS label. Clear it? [y/N]: " _clear_it
+                    if [[ "$_clear_it" =~ ^[Yy]$ ]]; then
+                        zpool labelclear -f "$_id"
+                    else
+                        echo "Error: Cannot create pool — existing label on $_id. Run: zpool labelclear -f $_id"
+                        exit 1
+                    fi
+                fi
+            done
+
             zpool create -o ashift=$ASHIFT \
                          -O compression=${COMPRESSION} \
                          -O atime=$ZFS_ATIME \
@@ -1986,7 +2046,7 @@ DOCKEREOF
     if [[ -n "$DATAPOOL_NAME" ]]; then
         echo "  - Datapool '$DATAPOOL_NAME' created and mounted at $DATAPOOL_MOUNTPOINT"
     else
-        echo "  - Datapool partition ready: Check with 'lsblk' (likely ${DISK}p4 or ${DISK}4)"
+        echo "  - No datapool configured (system-only install)"
     fi
     echo "  - Sanoid configured for hourly/daily/monthly snapshots"
     echo "  - APT hook creates snapshots before updates (keeps last 10, cleaned weekly)"
@@ -2004,13 +2064,7 @@ DOCKEREOF
             echo "  2. Create datasets in $DATAPOOL_NAME as needed (e.g. zfs create $DATAPOOL_NAME/data)"
         fi
     else
-        echo "  2. Create your datapool manually when ready:"
-        echo "     First, identify your datapool partition with: ls /dev/disk/by-id/ | grep part4"
-        echo "     Then: zpool create -o ashift=12 -O compression=lz4 datapool /dev/disk/by-id/PARTITION-ID"
-        echo "  3. Create datasets in datapool as needed:"
-        echo "     zfs create datapool/docker"
-        echo "     zfs create datapool/services"
-        echo "  4. Configure datapool in /etc/sanoid/sanoid.conf"
+        echo "  2. No datapool configured. Re-run with DATAPOOL_NAME set if needed later."
     fi
     echo ""
     echo "Snapshot management:"
