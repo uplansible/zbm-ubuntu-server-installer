@@ -42,6 +42,7 @@ APT_MIRROR="https://archive.ubuntu.com/ubuntu"
 # Optional datapool configuration (set to empty string to skip)
 DATAPOOL_NAME="ssdupl"                 # Name of the datapool (leave empty to skip auto-creation)
 DATAPOOL_MOUNTPOINT=""                 # Derived from DATAPOOL_NAME in validate_inputs(); initialised here so set -u never fires
+DISK_DATAPOOL=""                        # Set only in single-disk mode; empty in separate-disks mode so set -u never fires
 DISK_DATAPOOL_ID=""                    # Resolved after partition creation; empty when DATAPOOL_NAME=""
 DATAPOOL_TOPOLOGY=""                   # Set by select_datapool_topology_and_disks()
 DATAPOOL_DISK_IDS=()
@@ -1138,13 +1139,13 @@ if [[ "$MODE" == "initial" ]]; then
     wipefs -a "$DISK_EFI" 2>/dev/null || true
     wipefs -a "$DISK_SWAP" 2>/dev/null || true
     wipefs -a "$DISK_RPOOL" 2>/dev/null || true
-    if [[ -n "$DATAPOOL_NAME" ]]; then
+    if [[ -n "$DISK_DATAPOOL" ]]; then
         wipefs -a "$DISK_DATAPOOL" 2>/dev/null || true
     fi
 
     # Clear any ZFS labels specifically
     zpool labelclear -f "$DISK_RPOOL" 2>/dev/null || true
-    if [[ -n "$DATAPOOL_NAME" ]]; then
+    if [[ -n "$DISK_DATAPOOL" ]]; then
         zpool labelclear -f "$DISK_DATAPOOL" 2>/dev/null || true
     fi
 
