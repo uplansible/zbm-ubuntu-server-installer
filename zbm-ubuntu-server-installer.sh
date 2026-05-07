@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.40
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.41
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -347,6 +347,20 @@ validate_inputs() {
     # Validate COMPRESSION
     if [[ ! "$COMPRESSION" =~ ^(lz4|zstd|gzip|none)$ ]]; then
         echo "Error: Invalid COMPRESSION '$COMPRESSION'. Must be one of: lz4, zstd, gzip, none"
+        exit 1
+    fi
+
+    # Validate KEYBOARD_LAYOUT (lowercase letters only, 2-8 chars; e.g. us, de, ch, latam)
+    if [[ ! "$KEYBOARD_LAYOUT" =~ ^[a-z]{2,8}$ ]]; then
+        echo "Error: Invalid KEYBOARD_LAYOUT '$KEYBOARD_LAYOUT'."
+        echo "       Must be 2-8 lowercase letters (e.g., us, de, ch, fr, latam)."
+        exit 1
+    fi
+
+    # Validate KEYBOARD_VARIANT (empty, or lowercase start + letters/digits/underscore/dash)
+    if [[ -n "$KEYBOARD_VARIANT" ]] && [[ ! "$KEYBOARD_VARIANT" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+        echo "Error: Invalid KEYBOARD_VARIANT '$KEYBOARD_VARIANT'."
+        echo "       Must be empty or start with a lowercase letter followed by letters, digits, underscores, or dashes."
         exit 1
     fi
 }
@@ -1306,7 +1320,7 @@ locale-gen "$LOCALE"
 update-locale LANG="$LOCALE"
 
 # Configure keyboard layout (reconfigure deferred until after packages are installed)
-cat > /etc/default/keyboard << KBEOF
+cat > /etc/default/keyboard << 'KBEOF'
 XKBLAYOUT="$KEYBOARD_LAYOUT"
 XKBVARIANT="$KEYBOARD_VARIANT"
 XKBOPTIONS=""
@@ -1368,9 +1382,6 @@ echo "tmpfs /tmp tmpfs defaults,nosuid,nodev,size=2G 0 0" >> /etc/fstab
 
 # Generate netplan backend config files
 netplan generate
-
-# Point /etc/resolv.conf at systemd-resolved stub resolver
-ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
 # Configure Sanoid for rpool
 mkdir -p /etc/sanoid
@@ -1459,6 +1470,11 @@ if [[ "$INSTALL_ZELLIJ" == "y" ]]; then
         fi
     fi
 fi
+
+# Point /etc/resolv.conf at systemd-resolved stub resolver.
+# Done last so Docker/Zellij curl calls still work: /run is not bind-mounted
+# into the chroot, making the symlink target unreachable until first boot.
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
 EOF
 
@@ -1653,7 +1669,7 @@ if efibootmgr -c -d "\$DISK" -p "\$PART_NUM" -L "ZFSBootMenu" -l '\EFI\ZBM\vmlin
     ZBM_BOOT_NUM=\$(efibootmgr | grep "ZFSBootMenu" | head -1 | sed 's/Boot\([0-9A-F]*\).*/\1/')
     if [[ -n "\$ZBM_BOOT_NUM" ]]; then
         CURRENT_ORDER=\$(efibootmgr | grep "BootOrder:" | sed 's/BootOrder: //')
-        NEW_ORDER=\$(echo "\$CURRENT_ORDER" | sed "s/\$ZBM_BOOT_NUM,\?//g" | sed "s/^,//")
+        NEW_ORDER=\$(echo "\$CURRENT_ORDER" | sed "s/\$ZBM_BOOT_NUM,\?//g" | sed "s/^,//;s/,\$//")
         efibootmgr -o "\$ZBM_BOOT_NUM,\$NEW_ORDER"
         echo "  ✓ ZFSBootMenu set as first boot priority (Boot\$ZBM_BOOT_NUM)"
     else
