@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.46
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.47
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -1671,7 +1671,7 @@ EFI:
   Enabled: true
 
 Kernel:
-  CommandLine: ro quiet loglevel=4
+  CommandLine: ro quiet loglevel=4 rd.driver.export=zfs
   Prefix: vmlinuz
 ZBMCONF
 
