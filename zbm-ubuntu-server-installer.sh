@@ -1305,16 +1305,13 @@ set -euo pipefail
 locale-gen "$LOCALE"
 update-locale LANG="$LOCALE"
 
-# Configure keyboard layout
+# Configure keyboard layout (reconfigure deferred until after packages are installed)
 cat > /etc/default/keyboard << KBEOF
 XKBLAYOUT="$KEYBOARD_LAYOUT"
 XKBVARIANT="$KEYBOARD_VARIANT"
 XKBOPTIONS=""
 BACKSPACE="guess"
 KBEOF
-dpkg-reconfigure -f noninteractive keyboard-configuration
-# Apply console keyboard layout (may not succeed in chroot, non-fatal)
-setupcon --force 2>/dev/null || true
 
 # Make transient apt errors fatal so stale package lists don't cause silent failures
 echo 'APT::Update::Error-Mode "any";' > /etc/apt/apt.conf.d/30apt_error_on_transient
@@ -1350,6 +1347,11 @@ apt install -y --no-install-recommends \
     dkms \
     software-properties-common \
     sanoid
+
+# keyboard-configuration and console-setup are now installed; apply the layout
+dpkg-reconfigure -f noninteractive keyboard-configuration
+# Apply console keyboard layout (may not succeed in chroot, non-fatal)
+setupcon --force 2>/dev/null || true
 
 # Configure ZFS in initramfs
 echo "zfs" >> /etc/initramfs-tools/modules
@@ -1648,7 +1650,7 @@ echo "Using disk \$DISK partition \$PART_NUM"
 if efibootmgr -c -d "\$DISK" -p "\$PART_NUM" -L "ZFSBootMenu" -l '\EFI\ZBM\vmlinuz.EFI' 2>&1; then
     # Set ZFSBootMenu as first boot priority
     echo "Setting ZFSBootMenu as first boot priority..."
-    ZBM_BOOT_NUM=\$(efibootmgr | grep "ZFSBootMenu" | grep -i "vmlinuz" | head -1 | sed 's/Boot\([0-9A-F]*\).*/\1/')
+    ZBM_BOOT_NUM=\$(efibootmgr | grep "ZFSBootMenu" | head -1 | sed 's/Boot\([0-9A-F]*\).*/\1/')
     if [[ -n "\$ZBM_BOOT_NUM" ]]; then
         CURRENT_ORDER=\$(efibootmgr | grep "BootOrder:" | sed 's/BootOrder: //')
         NEW_ORDER=\$(echo "\$CURRENT_ORDER" | sed "s/\$ZBM_BOOT_NUM,\?//g" | sed "s/^,//")
