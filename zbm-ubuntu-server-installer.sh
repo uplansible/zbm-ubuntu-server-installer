@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.42
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.44
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -1896,6 +1896,19 @@ EOF
     echo "  2. Reboot the system"
     echo "  3. Login as $USERNAME"
     echo "  4. Run: sudo ~/zbm-installer/$(basename "$0") postreboot"
+    echo ""
+    echo "Postreboot will:"
+    echo "  - Set up Sanoid snapshot schedules"
+    if [[ -n "$DATAPOOL_NAME" ]]; then
+        if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
+            echo "  - Ask which disk(s) to use for the datapool ($DATAPOOL_NAME)"
+            echo "    and create the pool (single / mirror / raidz)"
+        else
+            echo "  - Create the datapool ($DATAPOOL_NAME) on partition 4 of $DISK"
+        fi
+    fi
+    [[ "$INSTALL_ZELLIJ" == "y" ]] && echo "  - Install Zellij"
+    [[ "$INSTALL_DOCKER" == "y" ]] && echo "  - Install Docker"
     echo ""
     echo "Reboot now? (y/n)"
     read -r response
