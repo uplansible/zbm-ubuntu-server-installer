@@ -39,6 +39,7 @@ Automated installation script for Ubuntu 26.04 Server with ZFS root filesystem a
 
    All configuration is collected interactively — no script editing required. You will be prompted for:
    - **Disk** — select from detected disks
+   - **Disk setup mode** — single disk (rpool + datapool share one disk) or separate disks (rpool on install disk, datapool on other disk(s))
    - **Hostname**, **Username**, **Password**
    - **Timezone** — e.g. `Europe/Zurich`
    - **Locale** — e.g. `en_GB.UTF-8`
@@ -56,19 +57,30 @@ Automated installation script for Ubuntu 26.04 Server with ZFS root filesystem a
 
 ## 📖 Documentation
 
-- **[INSTALLATION-GUIDE.md](INSTALLATION-GUIDE.md)** - Complete step-by-step installation guide
 - **[QUICK-REFERENCE.md](QUICK-REFERENCE.md)** - Common ZFS/Sanoid/Syncoid commands
 
 ## 🏗️ Architecture
 
 ### Disk Layout
 
-**Partition Structure (defaults, configurable interactively):**
+Two modes are available, selected interactively during install:
+
+**Single-disk mode** — rpool and datapool share the install disk:
 ```
 Partition 1:  1GB         EFI System Partition
-Partition 2:  auto (RAM)  Swap
+Partition 2:  auto (RAM)  Swap (encrypted, ephemeral key)
 Partition 3:  80% of disk rpool (ZFS root)
-Partition 4:  Rest        datapool (created automatically in postreboot if configured)
+Partition 4:  Rest        datapool (created in postreboot if configured)
+```
+
+**Separate-disks mode** — rpool on install disk, datapool on separate disk(s):
+```
+Install disk:
+  Partition 1:  1GB         EFI System Partition
+  Partition 2:  auto (RAM)  Swap (encrypted, ephemeral key)
+  Partition 3:  100% rest   rpool (ZFS root)
+
+Datapool disk(s): whole disks — single / mirror / raidz1 / raidz2 / raidz3
 ```
 
 **ZFS Structure:**
@@ -298,6 +310,19 @@ sudo zpool status
 sudo reboot
 ```
 
+### Ran out of Space in rpool
+
+```bash
+# Find which snapshots are using the most space
+zfs list -t snapshot -o name,used -s used | head -20
+
+# Delete a specific snapshot
+sudo zfs destroy rpool/ROOT/ubuntu-1@old-snapshot
+
+# Or let Sanoid prune according to its retention policy
+sudo sanoid --prune-snapshots --verbose
+```
+
 ### ZFSBootMenu Not Appearing
 - Check UEFI boot mode (not legacy BIOS)
 - Verify EFI boot entry: `efibootmgr`
@@ -374,12 +399,36 @@ MIT License - See LICENSE file for details
 ## 💬 Support
 
 For issues or questions:
-1. Check [INSTALLATION-GUIDE.md](INSTALLATION-GUIDE.md)
-2. Check [TEST-VALIDATION.md](TEST-VALIDATION.md) for known issues
-3. Review error messages from validation functions
-4. Open an issue on GitHub
+1. Check [QUICK-REFERENCE.md](QUICK-REFERENCE.md) for common commands
+2. Review error messages from validation functions
+3. Open an issue on GitHub
 
 ## 🔄 Version History
+
+### Version 3.0.48 (2026-05-07)
+- 🗂️ Disk selection menu: selected disks are removed from the list after each pick (no duplicate-selection possible)
+
+### Version 3.0.47 (2026-05-07)
+- 🔧 Add `rd.driver.export=zfs` to ZFSBootMenu kernel command line (ensures ZFS driver exports cleanly on boot)
+
+### Version 3.0.46 (2026-05-07)
+- 📦 Add `systemd-timesyncd` to chroot package list so time sync is available immediately after first boot
+- 🐛 Init `DISK_DATAPOOL=""` globally; guard `wipefs`/`labelclear` with `-n` check to prevent accidental wipe in dry-run mode
+
+### Version 3.0.45 (2026-05-07)
+- 🐛 Fix separate-disks mode incorrectly checking partition 4 when verifying rpool disk
+
+### Version 3.0.44 (2026-05-07)
+- 📝 Clarify end-of-initial-phase message with explicit postreboot task list
+
+### Version 3.0.43 (2026-05-07)
+- 🐛 Fix `local` keyword used outside a function in separate-disks `RPOOL_SIZE` calculation
+
+### Version 3.0.42 (2026-05-07)
+- ✨ Add `DISK_SETUP_MODE` — interactive prompt asks whether rpool and datapool share one disk or use separate disks; datapool topology (single / mirror / raidz1 / raidz2 / raidz3) selectable for multi-disk setups
+
+### Version 3.0.41 (2026-05-06)
+- 🐛 Fix EFI boot order entry with trailing comma, resolve `resolv.conf` symlink ordering, add keyboard layout validation
 
 ### Version 3.0.40 (2026-05-06)
 - 🔒 User password no longer written to disk — set via `chpasswd` stdin pipe after chroot; safe for all metacharacters
