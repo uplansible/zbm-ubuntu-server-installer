@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.44
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.45
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -1070,7 +1070,7 @@ if [[ "$MODE" == "initial" ]]; then
     DISK_EFI="${DISK}${PART_PREFIX}1"
     DISK_SWAP="${DISK}${PART_PREFIX}2"
     DISK_RPOOL="${DISK}${PART_PREFIX}3"
-    if [[ -n "$DATAPOOL_NAME" ]]; then
+    if [[ -n "$DATAPOOL_NAME" && "$DISK_SETUP_MODE" == "single-disk" ]]; then
         DISK_DATAPOOL="${DISK}${PART_PREFIX}4"
     fi
 
@@ -1079,7 +1079,7 @@ if [[ "$MODE" == "initial" ]]; then
     MAX_RETRIES=5
     RETRY_DELAY=1
     PARTS_TO_CHECK=("$DISK_EFI" "$DISK_SWAP" "$DISK_RPOOL")
-    if [[ -n "$DATAPOOL_NAME" ]]; then
+    if [[ -n "$DATAPOOL_NAME" && "$DISK_SETUP_MODE" == "single-disk" ]]; then
         PARTS_TO_CHECK+=("$DISK_DATAPOOL")
     fi
     for part in "${PARTS_TO_CHECK[@]}"; do
@@ -1109,7 +1109,7 @@ if [[ "$MODE" == "initial" ]]; then
     echo "Resolving partition by-id paths..."
     DISK_RPOOL_ID=$(resolve_part_byid "$DISK_RPOOL")
     echo "  rpool:    $DISK_RPOOL_ID"
-    if [[ -n "$DATAPOOL_NAME" ]]; then
+    if [[ -n "$DATAPOOL_NAME" && "$DISK_SETUP_MODE" == "single-disk" ]]; then
         DISK_DATAPOOL_ID=$(resolve_part_byid "$DISK_DATAPOOL")
         echo "  datapool: $DISK_DATAPOOL_ID"
     fi
