@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.45
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.46
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -1417,6 +1417,7 @@ apt install -y --no-install-recommends \
     ncdu \
     dkms \
     software-properties-common \
+    systemd-timesyncd \
     sanoid
 
 # keyboard-configuration and console-setup are now installed; apply the layout
