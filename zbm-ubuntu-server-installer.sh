@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.41
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.42
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -45,6 +45,7 @@ DATAPOOL_MOUNTPOINT=""                 # Derived from DATAPOOL_NAME in validate_
 DISK_DATAPOOL_ID=""                    # Resolved after partition creation; empty when DATAPOOL_NAME=""
 DATAPOOL_TOPOLOGY=""                   # Set by select_datapool_topology_and_disks()
 DATAPOOL_DISK_IDS=()
+DISK_SETUP_MODE=""                     # "single-disk" or "separate-disks"; set during interactive config
 
 # Optional software
 INSTALL_ZELLIJ="y"   # Install Zellij terminal multiplexer (y/n)
@@ -249,6 +250,27 @@ configure_interactively() {
         fi
     fi
 
+    # Disk setup mode (only relevant when a datapool is configured)
+    if [[ -n "$DATAPOOL_NAME" ]]; then
+        echo ""
+        echo "--- Disk setup ---"
+        echo "  [1] single-disk  — rpool and datapool share the same disk"
+        echo "                     (rpool = partition 3, datapool = partition 4)"
+        echo "  [2] separate     — rpool on one dedicated disk; datapool on separate disk(s)"
+        echo "                     (single whole disk / mirror / raidz)"
+        local mode_choice
+        while true; do
+            read -rp "Select disk setup [1/2]: " mode_choice
+            case "$mode_choice" in
+                1) DISK_SETUP_MODE="single-disk";   break ;;
+                2) DISK_SETUP_MODE="separate-disks"; break ;;
+                *) echo "Invalid selection. Enter 1 or 2." ;;
+            esac
+        done
+    else
+        DISK_SETUP_MODE="single-disk"
+    fi
+
     # Software
     echo ""
     echo "--- Software ---"
@@ -272,6 +294,7 @@ configure_interactively() {
     [[ -n "$KEYBOARD_VARIANT" ]] && kbd_summary="$KEYBOARD_LAYOUT/$KEYBOARD_VARIANT"
     echo "  Keyboard:     $kbd_summary"
     echo "  Datapool:     ${DATAPOOL_NAME:-<none>}"
+    echo "  Disk setup:   ${DISK_SETUP_MODE}"
     echo "  Zellij:       ${INSTALL_ZELLIJ}"
     echo "  Docker:       ${INSTALL_DOCKER}"
     echo "======================================================================"
@@ -443,7 +466,11 @@ resolve_part_byid() {
 select_disk() {
     echo ""
     echo "======================================================================"
-    echo "Available disks:"
+    if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
+        echo "Select the system disk (EFI, Swap, and rpool only — datapool on a separate disk):"
+    else
+        echo "Select the installation disk (rpool + datapool will share this disk):"
+    fi
     echo "======================================================================"
 
     # Collect non-loop, non-optical block devices
@@ -510,7 +537,11 @@ select_datapool_topology_and_disks() {
 
     # Build list of valid topologies based on available disk count
     local -a topo_labels topo_values
-    topo_labels+=("single  – partition 4 of install disk (no extra disks needed)")
+    if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
+        topo_labels+=("single  – 1 whole disk")
+    else
+        topo_labels+=("single  – partition 4 of install disk (no extra disks needed)")
+    fi
     topo_values+=("single")
     if [[ $n_extra -ge 2 ]]; then
         topo_labels+=("mirror  – 2 whole disks (mirrored redundancy)")
@@ -550,18 +581,25 @@ select_datapool_topology_and_disks() {
     DATAPOOL_TOPOLOGY="${topo_values[$((topo_choice-1))]}"
     DATAPOOL_DISK_IDS=()
 
-    [[ "$DATAPOOL_TOPOLOGY" == "single" ]] && return
+    # In single-disk mode, "single" uses partition 4 of the install disk — no disk selection needed.
+    # In separate-disks mode, "single" means 1 whole disk and still requires a selection below.
+    [[ "$DATAPOOL_TOPOLOGY" == "single" && "$DISK_SETUP_MODE" == "single-disk" ]] && return
 
     # Determine minimum disk count for the chosen topology
     local min_disks
     case "$DATAPOOL_TOPOLOGY" in
+        single)        min_disks=1 ;;
         mirror|raidz1) min_disks=2 ;;
         raidz2)        min_disks=3 ;;
         raidz3)        min_disks=4 ;;
     esac
 
     echo ""
-    echo "Select at least $min_disks disk(s) for the $DATAPOOL_TOPOLOGY pool."
+    if [[ "$DATAPOOL_TOPOLOGY" == "single" ]]; then
+        echo "Select the disk for the datapool (1 whole disk)."
+    else
+        echo "Select at least $min_disks disk(s) for the $DATAPOOL_TOPOLOGY pool."
+    fi
     echo "(Install disk $DISK is excluded.)"
 
     local -a selected_devs
@@ -577,6 +615,8 @@ select_datapool_topology_and_disks() {
         echo ""
 
         if [[ $count -ge $min_disks ]]; then
+            # "single" topology in separate-disks mode: exactly 1 disk, never ask for more
+            [[ "$DATAPOOL_TOPOLOGY" == "single" ]] && break
             local more
             read -rp "Add another disk? [y/N]: " more
             [[ ! "$more" =~ ^[Yy]$ ]] && break
@@ -680,10 +720,6 @@ show_disk_confirmation() {
     disk_bytes=$(blockdev --getsize64 "$disk")
     local disk_mib=$(( disk_bytes / 1024 / 1024 ))
 
-    local datapool_mib=$(( disk_mib - EFI_SIZE - SWAP_SIZE - RPOOL_SIZE - 2048 ))
-    # Clamp to 0 if negative (shouldn't happen, but be safe)
-    if [[ $datapool_mib -lt 0 ]]; then datapool_mib=0; fi
-
     local datapool_label="${DATAPOOL_NAME:-<none>}"
 
     echo ""
@@ -694,10 +730,17 @@ show_disk_confirmation() {
     printf "Target disk:  %s  (%dGiB total)\n" "$disk" "$(( disk_mib / 1024 ))"
     echo ""
     echo "Partition layout:"
-    printf "  Partition 1 (EFI):      %dGiB\n"     "$(( EFI_SIZE / 1024 ))"
-    printf "  Partition 2 (Swap):     %dGiB\n"     "$(( SWAP_SIZE / 1024 ))"
-    printf "  Partition 3 (rpool):    %dGiB\n"     "$(( RPOOL_SIZE / 1024 ))"
-    printf "  Partition 4 (datapool): ~%dGiB (remaining)\n" "$(( datapool_mib / 1024 ))"
+    printf "  Partition 1 (EFI):      %dGiB\n"  "$(( EFI_SIZE / 1024 ))"
+    printf "  Partition 2 (Swap):     %dGiB\n"  "$(( SWAP_SIZE / 1024 ))"
+    if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
+        printf "  Partition 3 (rpool):    ~%dGiB (all remaining)\n" "$(( RPOOL_SIZE / 1024 ))"
+        printf "  Datapool:               separate disk(s) — topology selected at postreboot\n"
+    else
+        local datapool_mib=$(( disk_mib - EFI_SIZE - SWAP_SIZE - RPOOL_SIZE - 2048 ))
+        if [[ $datapool_mib -lt 0 ]]; then datapool_mib=0; fi
+        printf "  Partition 3 (rpool):    %dGiB\n"     "$(( RPOOL_SIZE / 1024 ))"
+        printf "  Partition 4 (datapool): ~%dGiB (remaining)\n" "$(( datapool_mib / 1024 ))"
+    fi
     echo ""
     echo "System configuration:"
     echo "  Hostname:     $HOSTNAME"
@@ -927,7 +970,17 @@ if [[ "$MODE" == "initial" ]]; then
     validate_disk_size "$DISK"
 
     # Interactively select rpool percentage and compute RPOOL_SIZE
-    select_rpool_percent "$DISK"
+    if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
+        # rpool gets the full remaining disk — no percentage question
+        local _disk_bytes _disk_mib
+        _disk_bytes=$(blockdev --getsize64 "$DISK")
+        _disk_mib=$(( _disk_bytes / 1024 / 1024 ))
+        RPOOL_SIZE=$(( _disk_mib - EFI_SIZE - SWAP_SIZE - 2048 ))
+        echo ""
+        echo "rpool will use all remaining disk space: $(( RPOOL_SIZE / 1024 ))GiB"
+    else
+        select_rpool_percent "$DISK"
+    fi
 
     # Show full confirmation table and require explicit YES before any destructive steps
     show_disk_confirmation "$DISK"
@@ -994,9 +1047,13 @@ if [[ "$MODE" == "initial" ]]; then
     sgdisk --zap-all "$DISK"
     sgdisk -n1:0:+${EFI_SIZE}M -t1:EF00 "$DISK"     # EFI  (MiB)
     sgdisk -n2:0:+${SWAP_SIZE}M -t2:8200 "$DISK"    # Swap (MiB)
-    sgdisk -n3:0:+${RPOOL_SIZE}M -t3:BF00 "$DISK"   # rpool (MiB)
-    if [[ -n "$DATAPOOL_NAME" ]]; then
-        sgdisk -n4:0:0 -t4:BF00 "$DISK"             # datapool (ZFS partition)
+    if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
+        sgdisk -n3:0:0 -t3:BF00 "$DISK"             # rpool (all remaining space)
+    else
+        sgdisk -n3:0:+${RPOOL_SIZE}M -t3:BF00 "$DISK"   # rpool (MiB)
+        if [[ -n "$DATAPOOL_NAME" ]]; then
+            sgdisk -n4:0:0 -t4:BF00 "$DISK"         # datapool (ZFS partition)
+        fi
     fi
 
     # Wait for kernel to update partition table
@@ -1776,6 +1833,7 @@ DISK_RPOOL_ID="$DISK_RPOOL_ID"
 DISK_DATAPOOL_ID="$DISK_DATAPOOL_ID"
 DATAPOOL_NAME="$DATAPOOL_NAME"
 DATAPOOL_MOUNTPOINT="$DATAPOOL_MOUNTPOINT"
+DISK_SETUP_MODE="$DISK_SETUP_MODE"
 KEYBOARD_LAYOUT="$KEYBOARD_LAYOUT"
 KEYBOARD_VARIANT="$KEYBOARD_VARIANT"
 INSTALL_ZELLIJ="$INSTALL_ZELLIJ"
@@ -1928,22 +1986,34 @@ elif [[ "$MODE" == "postreboot" ]]; then
         if zpool list "$DATAPOOL_NAME" &>/dev/null; then
             echo "  ✓ Datapool '$DATAPOOL_NAME' already imported, skipping creation"
         elif [[ "$DATAPOOL_TOPOLOGY" == "single" ]]; then
-            # Use partition 4 of the install disk (existing behaviour)
-            if [[ "$DISK" =~ nvme|mmcblk|loop ]]; then PART_PREFIX="p"; else PART_PREFIX=""; fi
-            DATAPOOL_PARTITION="${DISK}${PART_PREFIX}4"
-            if [[ ! -b "$DATAPOOL_PARTITION" ]]; then
-                echo "Error: Datapool partition $DATAPOOL_PARTITION not found!"
-                lsblk "$DISK" || true
-                exit 1
+            if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
+                # Separate mode: "single" means 1 whole disk selected interactively
+                DISK_DATAPOOL_ID="${DATAPOOL_DISK_IDS[0]}"
+                echo "  - Using whole disk: $DISK_DATAPOOL_ID"
+                zpool create -o ashift=$ASHIFT \
+                             -O compression=${COMPRESSION} \
+                             -O atime=$ZFS_ATIME \
+                             -O mountpoint="$DATAPOOL_MOUNTPOINT" \
+                             "$DATAPOOL_NAME" "$DISK_DATAPOOL_ID"
+                echo "  ✓ Datapool '$DATAPOOL_NAME' (single whole disk) created at $DATAPOOL_MOUNTPOINT"
+            else
+                # Single-disk mode: use partition 4 of the install disk (original behaviour)
+                if [[ "$DISK" =~ nvme|mmcblk|loop ]]; then PART_PREFIX="p"; else PART_PREFIX=""; fi
+                DATAPOOL_PARTITION="${DISK}${PART_PREFIX}4"
+                if [[ ! -b "$DATAPOOL_PARTITION" ]]; then
+                    echo "Error: Datapool partition $DATAPOOL_PARTITION not found!"
+                    lsblk "$DISK" || true
+                    exit 1
+                fi
+                DISK_DATAPOOL_ID=$(resolve_part_byid "$DATAPOOL_PARTITION")
+                echo "  - Using partition: $DISK_DATAPOOL_ID"
+                zpool create -o ashift=$ASHIFT \
+                             -O compression=${COMPRESSION} \
+                             -O atime=$ZFS_ATIME \
+                             -O mountpoint="$DATAPOOL_MOUNTPOINT" \
+                             "$DATAPOOL_NAME" "$DISK_DATAPOOL_ID"
+                echo "  ✓ Datapool '$DATAPOOL_NAME' (single) created at $DATAPOOL_MOUNTPOINT"
             fi
-            DISK_DATAPOOL_ID=$(resolve_part_byid "$DATAPOOL_PARTITION")
-            echo "  - Using partition: $DISK_DATAPOOL_ID"
-            zpool create -o ashift=$ASHIFT \
-                         -O compression=${COMPRESSION} \
-                         -O atime=$ZFS_ATIME \
-                         -O mountpoint="$DATAPOOL_MOUNTPOINT" \
-                         "$DATAPOOL_NAME" "$DISK_DATAPOOL_ID"
-            echo "  ✓ Datapool '$DATAPOOL_NAME' (single) created at $DATAPOOL_MOUNTPOINT"
         else
             # Multi-disk topology: use whole disks selected interactively
             echo "  - Disks: ${DATAPOOL_DISK_IDS[*]}"
