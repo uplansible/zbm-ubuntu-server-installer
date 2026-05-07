@@ -972,7 +972,6 @@ if [[ "$MODE" == "initial" ]]; then
     # Interactively select rpool percentage and compute RPOOL_SIZE
     if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
         # rpool gets the full remaining disk — no percentage question
-        local _disk_bytes _disk_mib
         _disk_bytes=$(blockdev --getsize64 "$DISK")
         _disk_mib=$(( _disk_bytes / 1024 / 1024 ))
         RPOOL_SIZE=$(( _disk_mib - EFI_SIZE - SWAP_SIZE - 2048 ))
