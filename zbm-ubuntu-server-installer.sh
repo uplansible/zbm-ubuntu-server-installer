@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.47
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.48
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -605,13 +605,19 @@ select_datapool_topology_and_disks() {
 
     local -a selected_devs
     local count=0
+    local -a avail_indices
+    for i in "${!extra_names[@]}"; do avail_indices+=("$i"); done
 
     while true; do
         echo ""
         echo "Available extra disks:"
-        for i in "${!extra_names[@]}"; do
+        local -a menu_map=()
+        local j=1
+        for i in "${avail_indices[@]}"; do
             printf "  [%d] /dev/%-10s  %-8s  %s\n" \
-                "$((i+1))" "${extra_names[$i]}" "${extra_sizes[$i]}" "${extra_models[$i]}"
+                "$j" "${extra_names[$i]}" "${extra_sizes[$i]}" "${extra_models[$i]}"
+            menu_map+=("$i")
+            j=$((j+1))
         done
         echo ""
 
@@ -623,27 +629,31 @@ select_datapool_topology_and_disks() {
             [[ ! "$more" =~ ^[Yy]$ ]] && break
         fi
 
+        local n_avail=${#avail_indices[@]}
         local choice
         while true; do
-            read -rp "Select disk number [1-${#extra_names[@]}]: " choice
+            read -rp "Select disk number [1-${n_avail}]: " choice
             if [[ "$choice" =~ ^[0-9]+$ ]] && \
-               [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#extra_names[@]} ]]; then
-                local dev="/dev/${extra_names[$((choice-1))]}"
-                if [[ " ${selected_devs[*]} " == *" $dev "* ]]; then
-                    echo "Already selected. Choose a different disk."
-                else
-                    break
-                fi
+               [[ "$choice" -ge 1 ]] && [[ "$choice" -le $n_avail ]]; then
+                break
             else
                 echo "Invalid selection."
             fi
         done
 
-        local chosen_dev="/dev/${extra_names[$((choice-1))]}"
+        local orig_idx="${menu_map[$((choice-1))]}"
+        local chosen_dev="/dev/${extra_names[$orig_idx]}"
         selected_devs+=("$chosen_dev")
         DATAPOOL_DISK_IDS+=("$(resolve_part_byid "$chosen_dev")")
         count=$((count+1))
-        echo "  + Added: $chosen_dev (${extra_sizes[$((choice-1))]})"
+        echo "  + Added: $chosen_dev (${extra_sizes[$orig_idx]})"
+
+        # Remove selected disk from the available list
+        local -a new_avail=()
+        for i in "${avail_indices[@]}"; do
+            [[ "$i" -ne "$orig_idx" ]] && new_avail+=("$i")
+        done
+        avail_indices=("${new_avail[@]}")
     done
 
     echo ""
