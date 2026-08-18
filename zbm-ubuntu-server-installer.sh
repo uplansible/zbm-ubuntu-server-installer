@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.50
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.51
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -48,12 +48,40 @@ DATAPOOL_TOPOLOGY=""                   # Set by select_datapool_topology_and_dis
 DATAPOOL_DISK_IDS=()
 DISK_SETUP_MODE=""                     # "single-disk" or "separate-disks"; set during interactive config
 
-# Optional software (prompted during postreboot, not initial)
-INSTALL_DOCKER=""    # y/n — Docker Engine via official apt repo; asked in postreboot
-INSTALL_VIRT=""      # y/n — KVM/libvirt headless virtualization; asked in postreboot
+# Optional software (all prompted during postreboot, not initial)
+# Containers & virtualization
+INSTALL_DOCKER=""    # y/n — Docker Engine via official apt repo
+INSTALL_PODMAN=""    # y/n — rootless Podman from the Ubuntu archive
+INSTALL_VIRT=""      # y/n — KVM/libvirt headless virtualization
+# System health & updates
+INSTALL_HEALTH=""    # y/n — smartmontools, ZED mail alerts, monthly scrub timers
+INSTALL_UNATTENDED="" # y/n — unattended-upgrades (security updates)
+INSTALL_MTA=""       # y/n — msmtp as sendmail replacement (relay for all alert mail)
+ADMIN_EMAIL=""       # destination for smartd/ZED/fail2ban/unattended-upgrades mail
+SMTP_HOST=""         # msmtp relay host
+SMTP_PORT="587"      # 587 = STARTTLS, 465 = implicit TLS
+SMTP_USER=""         # SMTP login
+SMTP_PASS=""         # SMTP password — only ever written to /etc/msmtprc (mode 600)
+MAIL_FROM=""         # envelope/header sender
+# Remote access & security
+INSTALL_TAILSCALE="" # y/n — Tailscale mesh VPN
+TAILSCALE_AUTHKEY="" # optional tskey-... for unattended `tailscale up`
+HARDEN_SSH=""        # y/n — key-only SSH, no root login
+HARDEN_SSH_FORCE=""  # y/n — disable password login even without an authorized_keys file
+INSTALL_UFW=""       # y/n — host firewall (default deny incoming)
+INSTALL_FAIL2BAN=""  # y/n — SSH brute-force protection
+INSTALL_NUT=""       # y/n — UPS monitoring (Network UPS Tools)
+INSTALL_COCKPIT=""   # y/n — Cockpit web administration on :9090
+# Services
+INSTALL_SAMBA=""     # y/n — SMB/CIFS file server
+INSTALL_NFS=""       # y/n — NFS server (pairs with the ZFS sharenfs property)
+INSTALL_NODEEXP=""   # y/n — prometheus-node-exporter on :9100
+INSTALL_NETDATA=""   # y/n — netdata dashboard on :19999
+INSTALL_TOOLBELT=""  # y/n — git, rsync, jq, tree, fzf, ripgrep, bat, unzip
 POSTREBOOT_DONE="n"  # flipped to "y" in zbm-installer.conf when postreboot completes
 DOCKER_DATA_ROOT=""  # set by create_software_datasets()
 VIRT_STORAGE_DIR=""  # set by create_software_datasets()
+APT_UPDATED=0        # guard so apt_refresh() only updates package lists once per run
 
 ################################################################################
 # LOCALE SEARCH
@@ -1355,15 +1383,133 @@ detect_mode() {
 ################################################################################
 # POSTREBOOT SOFTWARE SELECTION & INSTALLATION
 ################################################################################
-# Interactive software selection for postreboot. Sets INSTALL_DOCKER, INSTALL_VIRT.
+# Interactive software selection for postreboot. Every question is asked here,
+# up front, so the installation steps that follow run unattended.
+# Sets all INSTALL_* / SMTP_* / ADMIN_EMAIL globals.
 prompt_postreboot_software() {
-    local input
     echo ""
     echo "--- Optional software ---"
-    read -rp "Install Docker Engine (official apt repo, not snap)? [Y/n]: " input
-    if [[ "$input" =~ ^[Nn]$ ]]; then INSTALL_DOCKER="n"; else INSTALL_DOCKER="y"; fi
-    read -rp "Install KVM/libvirt headless virtualization (qemu, libvirt, virtinst)? [y/N]: " input
-    if [[ "$input" =~ ^[Yy]$ ]]; then INSTALL_VIRT="y"; else INSTALL_VIRT="n"; fi
+    echo "    Everything is asked now; installation runs unattended afterwards."
+
+    echo ""
+    echo "  [Containers & virtualization]"
+    ask_yn "Install Docker Engine (official apt repo, not snap)?" y INSTALL_DOCKER
+    ask_yn "Install Podman (rootless containers, Ubuntu archive)?" n INSTALL_PODMAN
+    ask_yn "Install KVM/libvirt headless virtualization (qemu, libvirt, virtinst)?" n INSTALL_VIRT
+
+    echo ""
+    echo "  [System health & updates]"
+    ask_yn "Install disk/pool health monitoring (smartmontools, ZED mail, monthly scrub)?" y INSTALL_HEALTH
+    ask_yn "Enable unattended security upgrades (snapshot is taken by the existing apt hook)?" y INSTALL_UNATTENDED
+
+    if [[ "$INSTALL_HEALTH" == "y" || "$INSTALL_UNATTENDED" == "y" ]]; then
+        prompt_admin_email
+        ask_yn "Configure an SMTP relay (msmtp) so this mail actually leaves the machine?" y INSTALL_MTA
+        if [[ "$INSTALL_MTA" == "y" ]]; then
+            prompt_smtp_relay
+        else
+            echo "    Note: without an MTA the alert mail stays in the local root mailbox."
+        fi
+    fi
+
+    echo ""
+    echo "  [Remote access & security]"
+    ask_yn "Install Tailscale (mesh VPN)?" n INSTALL_TAILSCALE
+    if [[ "$INSTALL_TAILSCALE" == "y" ]]; then
+        read -rsp "    Tailscale auth key (tskey-…, empty = run 'tailscale up' manually later): " TAILSCALE_AUTHKEY
+        echo ""
+    fi
+    ask_yn "Harden SSH (key-only login, no root login)?" n HARDEN_SSH
+    if [[ "$HARDEN_SSH" == "y" ]]; then
+        local akeys
+        akeys="$(getent passwd "$USERNAME" | cut -d: -f6)/.ssh/authorized_keys"
+        if [[ ! -s "$akeys" ]]; then
+            echo "    ⚠ $akeys is missing or empty — disabling password login locks you out"
+            echo "      of SSH until you copy a key in (console access still works)."
+            ask_yn "  Disable password login anyway?" n HARDEN_SSH_FORCE
+            if [[ "$HARDEN_SSH_FORCE" != "y" ]]; then
+                echo "    → password login stays enabled; only root login and X11 forwarding are disabled."
+            fi
+        else
+            HARDEN_SSH_FORCE="y"
+        fi
+    fi
+    ask_yn "Install ufw host firewall (default deny incoming)?" n INSTALL_UFW
+    ask_yn "Install fail2ban (SSH brute-force protection)?" n INSTALL_FAIL2BAN
+    ask_yn "Install NUT (UPS monitoring / clean shutdown on power loss)?" n INSTALL_NUT
+    ask_yn "Install Cockpit web administration (https://<host>:9090)?" n INSTALL_COCKPIT
+
+    echo ""
+    echo "  [File & monitoring services]"
+    ask_yn "Install Samba (SMB/CIFS file server)?" n INSTALL_SAMBA
+    ask_yn "Install NFS server?" n INSTALL_NFS
+    ask_yn "Install prometheus-node-exporter (metrics on :9100)?" n INSTALL_NODEEXP
+    ask_yn "Install netdata (dashboard on :19999)?" n INSTALL_NETDATA
+
+    echo ""
+    echo "  [Shell tools]"
+    ask_yn "Install shell toolbelt (git, rsync, jq, tree, fzf, ripgrep, bat, unzip)?" y INSTALL_TOOLBELT
+
+    # fail2ban and unattended-upgrades mail to the admin too — make sure the
+    # address exists even when health monitoring itself was declined
+    if [[ -z "$ADMIN_EMAIL" ]] && [[ "$INSTALL_FAIL2BAN" == "y" ]]; then
+        prompt_admin_email
+    fi
+    [[ -z "$ADMIN_EMAIL" ]] && ADMIN_EMAIL="root"
+    return 0
+}
+
+# ask_yn <question> <default: y|n> <variable name>
+# Writes "y" or "n" into the named variable. Empty input takes the default.
+ask_yn() {
+    local question="$1" default="$2" varname="$3" input hint
+    if [[ "$default" == "y" ]]; then hint="[Y/n]"; else hint="[y/N]"; fi
+    read -rp "    $question $hint: " input
+    if [[ -z "$input" ]]; then
+        printf -v "$varname" '%s' "$default"
+    elif [[ "$input" =~ ^[Yy] ]]; then
+        printf -v "$varname" '%s' "y"
+    else
+        printf -v "$varname" '%s' "n"
+    fi
+}
+
+# Destination address for smartd, ZED, fail2ban and unattended-upgrades mail.
+# "root" (the local mailbox) is the fallback when nothing is entered.
+prompt_admin_email() {
+    if [[ -n "$ADMIN_EMAIL" ]]; then
+        return 0
+    fi
+    local input
+    while true; do
+        read -rp "    Admin e-mail for alerts (empty = local 'root' mailbox): " input
+        if [[ -z "$input" ]]; then
+            ADMIN_EMAIL="root"
+            return 0
+        fi
+        if [[ "$input" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+            ADMIN_EMAIL="$input"
+            return 0
+        fi
+        echo "    Invalid address."
+    done
+}
+
+# SMTP relay details for msmtp. The password is kept in memory and written only
+# to /etc/msmtprc (mode 600) — never to zbm-installer.conf or a temp file.
+prompt_smtp_relay() {
+    while [[ -z "$SMTP_HOST" ]]; do
+        read -rp "    SMTP relay host (e.g. smtp.example.com): " SMTP_HOST
+    done
+    read -rp "    SMTP port [587 = STARTTLS, 465 = implicit TLS] (587): " SMTP_PORT
+    [[ -z "$SMTP_PORT" ]] && SMTP_PORT="587"
+    :
+    read -rp "    SMTP username: " SMTP_USER
+    read -rsp "    SMTP password: " SMTP_PASS
+    echo ""
+    read -rp "    Sender address (From:) [${SMTP_USER:-root@$HOSTNAME}]: " MAIL_FROM
+    [[ -z "$MAIL_FROM" ]] && MAIL_FROM="${SMTP_USER:-root@$HOSTNAME}"
+    :
 }
 
 # Picks the pool that receives the software datasets (docker/virtmanager).
@@ -1523,7 +1669,9 @@ repoint_existing_docker() {
         read -rp "  Repoint Docker to $DOCKER_DATA_ROOT anyway? [y/N]: " _ans
     else
         read -rp "  Repoint Docker to $DOCKER_DATA_ROOT? [Y/n]: " _ans
-        [[ -z "$_ans" ]] && _ans="y"
+        # Plain `[[ ]] && cmd` would abort the run under set -e whenever the
+        # test fails, i.e. whenever the user actually typed an answer
+        if [[ -z "$_ans" ]]; then _ans="y"; fi
     fi
     if [[ ! "$_ans" =~ ^[Yy]$ ]]; then
         echo "  ✓ Leaving Docker data-root at $effective"
@@ -1641,6 +1789,424 @@ install_virtualization_postreboot() {
         echo "  ✓ libvirt 'default' pool already defined, skipping"
     fi
     echo "  ✓ KVM/libvirt installed (user $USERNAME in 'libvirt' group; re-login required)"
+}
+
+################################################################################
+# POSTREBOOT: SYSTEM HEALTH, SECURITY AND SERVICE INSTALLERS
+################################################################################
+# Package lists are refreshed once per postreboot run — the optional installers
+# below all need current lists, but only the first one should pay for it.
+apt_refresh() {
+    if [[ "${APT_UPDATED:-0}" -eq 0 ]]; then
+        apt update
+        APT_UPDATED=1
+    fi
+}
+
+# Config files below are edited in place, so every write is wrapped in a marker
+# block that is stripped first. That keeps re-runs idempotent without ever
+# clobbering settings the user or a package added around it.
+ZBM_BLOCK_START="# >>> zbm-installer managed >>>"
+ZBM_BLOCK_END="# <<< zbm-installer managed <<<"
+
+strip_managed_block() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    sed -i "/^${ZBM_BLOCK_START}\$/,/^${ZBM_BLOCK_END}\$/d" "$file"
+}
+
+# --- Mail relay -------------------------------------------------------------
+# msmtp-mta provides /usr/sbin/sendmail, which is what smartd, ZED, fail2ban and
+# unattended-upgrades all expect. Without it their mail rots in the local spool.
+install_mta_postreboot() {
+    apt_refresh
+    apt install -y --no-install-recommends msmtp msmtp-mta ca-certificates
+
+    local starttls="on"
+    if [[ "$SMTP_PORT" == "465" ]]; then starttls="off"; fi
+
+    # 0600 + root:root — this file holds the relay password in cleartext, which
+    # is unavoidable for an unattended MTA
+    install -m 600 -o root -g root /dev/null /etc/msmtprc
+    cat > /etc/msmtprc << MSMTPEOF
+# Written by zbm-ubuntu-server-installer
+defaults
+auth           on
+tls            on
+tls_starttls   $starttls
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile        /var/log/msmtp.log
+aliases        /etc/aliases
+
+account        default
+host           $SMTP_HOST
+port           $SMTP_PORT
+from           $MAIL_FROM
+user           $SMTP_USER
+password       $SMTP_PASS
+MSMTPEOF
+    chmod 600 /etc/msmtprc
+
+    # Alias map so mail addressed to root (smartd, cron, ZED) is rewritten
+    cat > /etc/aliases << ALIASEOF
+root: $ADMIN_EMAIL
+default: $ADMIN_EMAIL
+ALIASEOF
+
+    echo "  ✓ msmtp configured: $SMTP_USER@$SMTP_HOST:$SMTP_PORT → $ADMIN_EMAIL"
+    echo "    Test with: echo test | mail -s 'zbm test' $ADMIN_EMAIL"
+}
+
+# --- Disk and pool health ---------------------------------------------------
+# smartd watches the drives, ZED reports pool events, the scrub timers verify
+# the data itself. A snapshotting server without these three is silently
+# accumulating bad blocks.
+install_health_postreboot() {
+    apt_refresh
+    # bsd-mailx supplies /usr/bin/mail for ZED, but it depends on a
+    # mail-transport-agent — only pull it in once a sendmail binary exists
+    # (msmtp-mta from the previous step, or one already on the system),
+    # otherwise apt would drag postfix in behind it.
+    local -a health_pkgs=(smartmontools)
+    if [[ -x /usr/sbin/sendmail ]]; then
+        health_pkgs+=(bsd-mailx)
+    else
+        echo "  ⚠ No MTA installed — smartd/ZED alerts stay on this machine."
+        echo "    Re-run with the msmtp option, or install a mail-transport-agent."
+    fi
+    apt install -y --no-install-recommends "${health_pkgs[@]}"
+
+    # smartd: short self-test nightly at 02:00, long self-test Saturdays 03:00,
+    # temperature warnings, skip drives that are spun down
+    strip_managed_block /etc/smartd.conf
+    sed -i 's/^DEVICESCAN/#DEVICESCAN/' /etc/smartd.conf
+    cat >> /etc/smartd.conf << SMARTDEOF
+$ZBM_BLOCK_START
+DEVICESCAN -a -o on -S on -n standby,q -W 4,45,55 -s (S/../.././02|L/../../6/03) -m $ADMIN_EMAIL -M exec /usr/share/smartmontools/smartd-runner
+$ZBM_BLOCK_END
+SMARTDEOF
+    # Fails on hardware without SMART (VMs, some USB bridges) — not fatal
+    systemctl enable smartd 2>/dev/null || true
+    if systemctl restart smartd 2>/dev/null; then
+        echo "  ✓ smartd monitoring active (alerts → $ADMIN_EMAIL)"
+    else
+        echo "  ⚠ smartd could not start (no SMART-capable devices?) — config is in place"
+    fi
+
+    # ZED: mail on pool events. zed.rc is sourced as shell, so the appended
+    # block overrides whatever the package shipped further up.
+    if [[ -f /etc/zfs/zed.d/zed.rc ]]; then
+        strip_managed_block /etc/zfs/zed.d/zed.rc
+        cat >> /etc/zfs/zed.d/zed.rc << ZEDEOF
+$ZBM_BLOCK_START
+ZED_EMAIL_ADDR="$ADMIN_EMAIL"
+ZED_EMAIL_PROG="mail"
+ZED_EMAIL_OPTS="-s '@SUBJECT@' @ADDRESS@"
+ZED_NOTIFY_VERBOSE=1
+ZED_NOTIFY_DATA=1
+$ZBM_BLOCK_END
+ZEDEOF
+        systemctl restart zfs-zed 2>/dev/null || true
+        echo "  ✓ ZED pool alerts → $ADMIN_EMAIL"
+    else
+        echo "  ⚠ /etc/zfs/zed.d/zed.rc not found — ZED mail not configured"
+    fi
+
+    # Monthly scrub for every imported pool (zfsutils-linux ships the template)
+    if systemctl list-unit-files | grep -q '^zfs-scrub-monthly@\.timer'; then
+        local p
+        while IFS= read -r p; do
+            systemctl enable --now "zfs-scrub-monthly@${p}.timer" 2>/dev/null \
+                && echo "  ✓ monthly scrub enabled for pool '$p'" \
+                || echo "  ⚠ could not enable monthly scrub for '$p'"
+        done < <(zpool list -H -o name)
+    else
+        echo "  ⚠ zfs-scrub-monthly@.timer not available — add a scrub cron job manually"
+    fi
+}
+
+# --- Unattended security upgrades -------------------------------------------
+# Safe here because the APT pre-invoke hook from the initial install snapshots
+# rpool before every dpkg run: a bad upgrade is one ZFSBootMenu rollback away.
+# Automatic-Reboot stays off — rebooting a ZFS server unattended is not worth it.
+install_unattended_upgrades_postreboot() {
+    apt_refresh
+    apt install -y --no-install-recommends unattended-upgrades
+
+    cat > /etc/apt/apt.conf.d/52zbm-unattended-upgrades << UUEOF
+// Written by zbm-ubuntu-server-installer
+// Security pockets only — feature updates stay manual.
+Unattended-Upgrade::Allowed-Origins {
+    "\${distro_id}:\${distro_codename}-security";
+    "\${distro_id}ESMApps:\${distro_codename}-apps-security";
+    "\${distro_id}ESM:\${distro_codename}-infra-security";
+};
+Unattended-Upgrade::Mail "$ADMIN_EMAIL";
+Unattended-Upgrade::MailReport "on-change";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Automatic-Reboot "false";
+UUEOF
+
+    cat > /etc/apt/apt.conf.d/20auto-upgrades << AUEOF
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+AUEOF
+
+    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+    echo "  ✓ unattended-upgrades active (security pocket, no auto-reboot, report → $ADMIN_EMAIL)"
+    echo "    Every run is preceded by a ZFS snapshot via /etc/apt/apt.conf.d/80-zfs-snapshot"
+}
+
+# --- Tailscale --------------------------------------------------------------
+# The repo is keyed per Ubuntu codename; a brand-new release may not have one
+# yet, so fall back to the previous LTS suite rather than failing the install.
+install_tailscale_postreboot() {
+    local codename suite="" c
+    codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+    for c in "$codename" noble; do
+        if curl -fsI "https://pkgs.tailscale.com/stable/ubuntu/${c}.noarmor.gpg" >/dev/null 2>&1; then
+            suite="$c"
+            break
+        fi
+    done
+    if [[ -z "$suite" ]]; then
+        echo "  ⚠ No Tailscale apt suite found for '$codename' — skipping."
+        echo "    Install manually: curl -fsSL https://tailscale.com/install.sh | sh"
+        return 0
+    fi
+    if [[ "$suite" != "$codename" ]]; then
+        echo "  - No '$codename' suite yet, using '$suite'"
+    fi
+
+    curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${suite}.noarmor.gpg" \
+        -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+    chmod a+r /usr/share/keyrings/tailscale-archive-keyring.gpg
+    cat > /etc/apt/sources.list.d/tailscale.sources << TSEOF
+Types: deb
+URIs: https://pkgs.tailscale.com/stable/ubuntu
+Suites: $suite
+Components: main
+Signed-By: /usr/share/keyrings/tailscale-archive-keyring.gpg
+TSEOF
+
+    apt update
+    APT_UPDATED=1
+    apt install -y tailscale
+    systemctl enable --now tailscaled
+
+    if [[ -n "$TAILSCALE_AUTHKEY" ]]; then
+        if tailscale up --authkey "$TAILSCALE_AUTHKEY" --ssh; then
+            echo "  ✓ Tailscale connected: $(tailscale ip -4 2>/dev/null | head -1)"
+        else
+            echo "  ⚠ 'tailscale up' failed — run it manually"
+        fi
+    else
+        echo "  ✓ Tailscale installed — run 'sudo tailscale up --ssh' to join your tailnet"
+    fi
+}
+
+# --- SSH hardening ----------------------------------------------------------
+# The drop-in is numbered 10- on purpose: sshd takes the FIRST value it sees for
+# a keyword, so a later 50-cloud-init.conf must not be able to re-enable
+# password login. The config is validated and rolled back if sshd rejects it.
+harden_ssh_postreboot() {
+    local dropin=/etc/ssh/sshd_config.d/10-zbm-hardening.conf
+    mkdir -p /etc/ssh/sshd_config.d
+
+    {
+        echo "# Written by zbm-ubuntu-server-installer"
+        echo "PermitRootLogin no"
+        echo "X11Forwarding no"
+        echo "MaxAuthTries 4"
+        if [[ "$HARDEN_SSH_FORCE" == "y" ]]; then
+            echo "PasswordAuthentication no"
+            echo "KbdInteractiveAuthentication no"
+            echo "PubkeyAuthentication yes"
+        fi
+    } > "$dropin"
+
+    if /usr/sbin/sshd -t 2>/dev/null; then
+        systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+        # Socket activation (Ubuntu 24.04+) serves new connections from the socket unit
+        systemctl restart ssh.socket 2>/dev/null || true
+        if [[ "$HARDEN_SSH_FORCE" == "y" ]]; then
+            echo "  ✓ SSH hardened: key-only login, no root login"
+        else
+            echo "  ✓ SSH hardened: no root login (password login left enabled — no key present)"
+        fi
+    else
+        rm -f "$dropin"
+        echo "  ⚠ sshd rejected the hardening config — reverted, SSH left unchanged"
+    fi
+}
+
+# --- Host firewall ----------------------------------------------------------
+# Ports are opened from the selection flags, so this can run before the services
+# themselves are installed. SSH is allowed before the firewall is enabled.
+install_ufw_postreboot() {
+    apt_refresh
+    apt install -y --no-install-recommends ufw
+
+    # No 'ufw --force reset': a re-run must not wipe rules added by hand later.
+    # Every rule below is idempotent.
+    ufw default deny incoming >/dev/null
+    ufw default allow outgoing >/dev/null
+    ufw allow 22/tcp comment 'SSH' >/dev/null
+
+    if [[ "$INSTALL_TAILSCALE" == "y" ]]; then ufw allow in on tailscale0 comment 'Tailscale' >/dev/null; fi
+    if [[ "$INSTALL_COCKPIT" == "y" ]];   then ufw allow 9090/tcp comment 'Cockpit' >/dev/null; fi
+    if [[ "$INSTALL_NODEEXP" == "y" ]];   then ufw allow 9100/tcp comment 'node-exporter' >/dev/null; fi
+    if [[ "$INSTALL_NETDATA" == "y" ]];   then ufw allow 19999/tcp comment 'netdata' >/dev/null; fi
+    if [[ "$INSTALL_NFS" == "y" ]];       then ufw allow 2049/tcp comment 'NFSv4' >/dev/null; fi
+    if [[ "$INSTALL_SAMBA" == "y" ]]; then
+        ufw allow 445/tcp comment 'SMB' >/dev/null
+        ufw allow 139/tcp comment 'NetBIOS session' >/dev/null
+        ufw allow 137:138/udp comment 'NetBIOS name/datagram' >/dev/null
+    fi
+
+    ufw --force enable >/dev/null
+    echo "  ✓ ufw enabled (default deny incoming; SSH and selected services allowed)"
+    if [[ "$INSTALL_DOCKER" == "y" ]]; then
+        echo "  ⚠ Docker inserts its own iptables rules ahead of ufw: published container"
+        echo "    ports (-p) are reachable regardless of these rules. Bind them to"
+        echo "    127.0.0.1 (-p 127.0.0.1:8080:80) or use ufw-docker if that matters."
+    fi
+}
+
+# --- fail2ban ---------------------------------------------------------------
+install_fail2ban_postreboot() {
+    apt_refresh
+    # python3-systemd is what lets the systemd backend read the journal
+    apt install -y --no-install-recommends fail2ban python3-systemd
+
+    local banaction="iptables-multiport"
+    [[ "$INSTALL_UFW" == "y" ]] && banaction="ufw"
+
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/zbm-sshd.local << F2BEOF
+# Written by zbm-ubuntu-server-installer
+[DEFAULT]
+backend   = systemd
+banaction = $banaction
+bantime   = 1h
+findtime  = 10m
+maxretry  = 5
+destemail = $ADMIN_EMAIL
+sender    = root@$HOSTNAME
+
+[sshd]
+enabled = true
+F2BEOF
+
+    systemctl enable --now fail2ban 2>/dev/null || true
+    if systemctl is-active --quiet fail2ban; then
+        echo "  ✓ fail2ban active (sshd jail, ban action: $banaction)"
+    else
+        echo "  ⚠ fail2ban installed but not active — check 'journalctl -u fail2ban'"
+    fi
+}
+
+# --- UPS monitoring ---------------------------------------------------------
+# The UPS itself cannot be configured blind: driver, port and credentials depend
+# on the model. Install, set standalone mode, then report what is attached.
+install_nut_postreboot() {
+    apt_refresh
+    apt install -y --no-install-recommends nut-server nut-client
+
+    echo "MODE=standalone" > /etc/nut/nut.conf
+
+    echo "  ✓ NUT installed (MODE=standalone)"
+    echo "  - Scanning for a USB UPS..."
+    if command -v nut-scanner &>/dev/null && nut-scanner -q -U 2>/dev/null | grep -q '\['; then
+        echo ""
+        nut-scanner -q -U 2>/dev/null || true
+        echo ""
+        echo "    Paste the block above into /etc/nut/ups.conf, then:"
+    else
+        echo "    No USB UPS detected. Once one is attached, run 'nut-scanner -U' and"
+        echo "    put the output in /etc/nut/ups.conf, then:"
+    fi
+    echo "      /etc/nut/upsd.users  → [upsmon] password + upsmon primary"
+    echo "      /etc/nut/upsmon.conf → MONITOR <ups>@localhost 1 upsmon <pass> primary"
+    echo "      systemctl restart nut-server nut-monitor"
+}
+
+# --- Cockpit ----------------------------------------------------------------
+install_cockpit_postreboot() {
+    apt_refresh
+    local -a pkgs=(cockpit cockpit-storaged)
+    # NetworkManager is not used here (systemd-networkd), so cockpit-networkmanager
+    # is deliberately left out
+    if [[ "$INSTALL_VIRT" == "y" ]];   then pkgs+=(cockpit-machines); fi
+    if [[ "$INSTALL_PODMAN" == "y" ]]; then pkgs+=(cockpit-podman); fi
+    apt install -y --no-install-recommends "${pkgs[@]}"
+
+    systemctl enable --now cockpit.socket
+    echo "  ✓ Cockpit on https://$HOSTNAME:9090 (self-signed certificate; log in as $USERNAME)"
+    if [[ "$INSTALL_DOCKER" == "y" ]]; then
+        echo "    Note: Cockpit has no Docker module — only Podman is supported."
+    fi
+}
+
+# --- Podman -----------------------------------------------------------------
+install_podman_postreboot() {
+    apt_refresh
+    # uidmap/slirp4netns/fuse-overlayfs are what make the rootless mode work;
+    # fuse-overlayfs is also the storage driver that behaves on ZFS
+    apt install -y --no-install-recommends \
+        podman uidmap slirp4netns fuse-overlayfs
+    echo "  ✓ Podman $(podman --version 2>/dev/null | awk '{print $3}') installed"
+    echo "    Rootless storage lives in ~/.local/share/containers (per user)"
+}
+
+# --- File services ----------------------------------------------------------
+# Shares are not defined here: which dataset gets exported to whom is a decision
+# per machine. Both daemons are installed and enabled, ready to be pointed at a
+# dataset.
+install_samba_postreboot() {
+    apt_refresh
+    apt install -y --no-install-recommends samba
+    systemctl enable --now smbd nmbd 2>/dev/null || systemctl enable --now smbd 2>/dev/null || true
+    echo "  ✓ Samba installed"
+    echo "    Add the user:  smbpasswd -a $USERNAME"
+    echo "    Add a share:   edit /etc/samba/smb.conf (or 'zfs set sharesmb=on <dataset>')"
+}
+
+install_nfs_postreboot() {
+    apt_refresh
+    apt install -y --no-install-recommends nfs-kernel-server
+    systemctl enable --now nfs-server 2>/dev/null || true
+    echo "  ✓ NFS server installed"
+    echo "    Export a dataset: zfs set sharenfs='rw=@192.168.0.0/24' <pool>/<dataset>"
+}
+
+# --- Metrics ----------------------------------------------------------------
+install_nodeexp_postreboot() {
+    apt_refresh
+    apt install -y --no-install-recommends prometheus-node-exporter
+    systemctl enable --now prometheus-node-exporter 2>/dev/null || true
+    echo "  ✓ prometheus-node-exporter on :9100"
+}
+
+install_netdata_postreboot() {
+    apt_refresh
+    # netdata's dashboard needs its recommended plugin packages, so no
+    # --no-install-recommends here
+    apt install -y netdata
+    systemctl enable --now netdata 2>/dev/null || true
+    echo "  ✓ netdata on http://$HOSTNAME:19999 (archive version; upstream is newer)"
+    echo "    It listens on all interfaces — restrict it in /etc/netdata/netdata.conf if exposed"
+}
+
+# --- Shell toolbelt ---------------------------------------------------------
+install_toolbelt_postreboot() {
+    apt_refresh
+    apt install -y --no-install-recommends \
+        git rsync jq tree fzf ripgrep bat unzip
+    echo "  ✓ Shell tools installed (note: bat is called 'batcat' on Ubuntu)"
 }
 
 ################################################################################
@@ -2711,12 +3277,19 @@ elif [[ "$MODE" == "postreboot" ]]; then
     exec > >(tee -a "$POSTREBOOT_LOG") 2>&1
     echo "Post-reboot log: $POSTREBOOT_LOG"
 
+    # All questions are asked by prompt_postreboot_software(); no package may
+    # open a debconf dialog in the middle of the unattended installation steps
+    export DEBIAN_FRONTEND=noninteractive
+
     # Load persisted installation config from initial phase (co-located with this script)
     INSTALL_CONF="$(dirname "$0")/zbm-installer.conf"
     if [[ -f "$INSTALL_CONF" ]]; then
         # shellcheck source=/dev/null
         source "$INSTALL_CONF"
         echo "  ✓ Loaded installation config from $INSTALL_CONF"
+        # The conf does not carry HOSTNAME — take it from the running system so
+        # mail senders and printed URLs show the real name, not the default
+        HOSTNAME="$(hostname)"
     else
         echo "Error: $INSTALL_CONF not found."
         echo "postreboot must run from the installer directory created during install:"
@@ -2929,10 +3502,104 @@ EOF
         install_virtualization_postreboot
     fi
 
+    if [[ "$INSTALL_PODMAN" == "y" ]]; then
+        echo ""
+        echo "Step 7: Installing Podman..."
+        install_podman_postreboot
+    fi
+
+    # Mail relay first — smartd, ZED, fail2ban and unattended-upgrades all hand
+    # their alerts to /usr/sbin/sendmail, which only exists once msmtp-mta is in
+    if [[ "$INSTALL_MTA" == "y" ]]; then
+        echo ""
+        echo "Step 8: Configuring mail relay (msmtp)..."
+        install_mta_postreboot
+    fi
+
+    if [[ "$INSTALL_HEALTH" == "y" ]]; then
+        echo ""
+        echo "Step 9: Setting up disk and pool health monitoring..."
+        install_health_postreboot
+    fi
+
+    if [[ "$INSTALL_UNATTENDED" == "y" ]]; then
+        echo ""
+        echo "Step 10: Enabling unattended security upgrades..."
+        install_unattended_upgrades_postreboot
+    fi
+
+    if [[ "$INSTALL_TAILSCALE" == "y" ]]; then
+        echo ""
+        echo "Step 11: Installing Tailscale..."
+        install_tailscale_postreboot
+    fi
+
+    if [[ "$INSTALL_COCKPIT" == "y" ]]; then
+        echo ""
+        echo "Step 12: Installing Cockpit..."
+        install_cockpit_postreboot
+    fi
+
+    if [[ "$INSTALL_SAMBA" == "y" ]]; then
+        echo ""
+        echo "Step 13: Installing Samba..."
+        install_samba_postreboot
+    fi
+
+    if [[ "$INSTALL_NFS" == "y" ]]; then
+        echo ""
+        echo "Step 14: Installing NFS server..."
+        install_nfs_postreboot
+    fi
+
+    if [[ "$INSTALL_NODEEXP" == "y" ]]; then
+        echo ""
+        echo "Step 15: Installing prometheus-node-exporter..."
+        install_nodeexp_postreboot
+    fi
+
+    if [[ "$INSTALL_NETDATA" == "y" ]]; then
+        echo ""
+        echo "Step 16: Installing netdata..."
+        install_netdata_postreboot
+    fi
+
+    if [[ "$INSTALL_NUT" == "y" ]]; then
+        echo ""
+        echo "Step 17: Installing UPS monitoring (NUT)..."
+        install_nut_postreboot
+    fi
+
+    if [[ "$INSTALL_TOOLBELT" == "y" ]]; then
+        echo ""
+        echo "Step 18: Installing shell toolbelt..."
+        install_toolbelt_postreboot
+    fi
+
+    # Hardening runs last: SSH first (so a broken config is caught while the
+    # session is still open), then fail2ban, then the firewall that both depend on
+    if [[ "$HARDEN_SSH" == "y" ]]; then
+        echo ""
+        echo "Step 19: Hardening SSH..."
+        harden_ssh_postreboot
+    fi
+
+    if [[ "$INSTALL_FAIL2BAN" == "y" ]]; then
+        echo ""
+        echo "Step 20: Installing fail2ban..."
+        install_fail2ban_postreboot
+    fi
+
+    if [[ "$INSTALL_UFW" == "y" ]]; then
+        echo ""
+        echo "Step 21: Enabling the ufw host firewall..."
+        install_ufw_postreboot
+    fi
+
     # Written only after everything above succeeded, so a failed run keeps
     # mode auto-detection pointing at postreboot for a re-run
     echo ""
-    echo "Step 7: Recording postreboot completion..."
+    echo "Step 22: Recording postreboot completion..."
     if grep -q '^POSTREBOOT_DONE=' "$INSTALL_CONF"; then
         sed -i 's/^POSTREBOOT_DONE=.*/POSTREBOOT_DONE="y"/' "$INSTALL_CONF"
     else
@@ -2973,6 +3640,57 @@ EOF
     fi
     if [[ "$INSTALL_DOCKER" == "y" || "$INSTALL_VIRT" == "y" ]]; then
         echo "  - Re-login (or reboot) so docker/libvirt group membership takes effect"
+    fi
+    if [[ "$INSTALL_HEALTH" == "y" ]]; then
+        echo "  - Health monitoring: smartd + ZED alerts → $ADMIN_EMAIL, monthly scrub timers"
+        echo "    Check with: smartctl -a /dev/<disk> | systemctl list-timers 'zfs-scrub*'"
+    fi
+    if [[ "$INSTALL_MTA" == "y" ]]; then
+        echo "  - Mail relay: $SMTP_HOST:$SMTP_PORT (credentials in /etc/msmtprc, mode 600)"
+        echo "    Send a test: echo test | mail -s 'zbm test' $ADMIN_EMAIL"
+    elif [[ "$INSTALL_HEALTH" == "y" || "$INSTALL_UNATTENDED" == "y" ]]; then
+        echo "  - No MTA configured — alert mail stays in the local root mailbox"
+    fi
+    if [[ "$INSTALL_UNATTENDED" == "y" ]]; then
+        echo "  - Unattended security upgrades on (no auto-reboot); each run is snapshotted"
+        echo "    Dry run: unattended-upgrade --dry-run --debug"
+    fi
+    if [[ "$INSTALL_TAILSCALE" == "y" ]]; then
+        if [[ -n "$TAILSCALE_AUTHKEY" ]]; then
+            echo "  - Tailscale connected — check with: tailscale status"
+        else
+            echo "  - Tailscale installed — join the tailnet with: sudo tailscale up --ssh"
+        fi
+    fi
+    if [[ "$HARDEN_SSH" == "y" ]]; then
+        echo "  - SSH hardening in /etc/ssh/sshd_config.d/10-zbm-hardening.conf"
+        if [[ "$HARDEN_SSH_FORCE" != "y" ]]; then
+            echo "    Password login is still enabled — copy a key in, then set PasswordAuthentication no"
+        fi
+    fi
+    if [[ "$INSTALL_UFW" == "y" ]]; then
+        echo "  - ufw active: ufw status verbose"
+    fi
+    if [[ "$INSTALL_FAIL2BAN" == "y" ]]; then
+        echo "  - fail2ban active: fail2ban-client status sshd"
+    fi
+    if [[ "$INSTALL_COCKPIT" == "y" ]]; then
+        echo "  - Cockpit: https://$HOSTNAME:9090"
+    fi
+    if [[ "$INSTALL_NETDATA" == "y" ]]; then
+        echo "  - netdata: http://$HOSTNAME:19999"
+    fi
+    if [[ "$INSTALL_NODEEXP" == "y" ]]; then
+        echo "  - node-exporter metrics: http://$HOSTNAME:9100/metrics"
+    fi
+    if [[ "$INSTALL_NUT" == "y" ]]; then
+        echo "  - NUT installed but not yet bound to a UPS — see the notes above"
+    fi
+    if [[ "$INSTALL_SAMBA" == "y" ]]; then
+        echo "  - Samba installed; add the user with: smbpasswd -a $USERNAME"
+    fi
+    if [[ "$INSTALL_NFS" == "y" ]]; then
+        echo "  - NFS server installed; export with: zfs set sharenfs=... <dataset>"
     fi
     echo "  - Re-run this script with no argument any time to update ZFSBootMenu"
     echo ""
