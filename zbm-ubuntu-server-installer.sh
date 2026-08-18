@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.51
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.52
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -1393,18 +1393,18 @@ prompt_postreboot_software() {
 
     echo ""
     echo "  [Containers & virtualization]"
-    ask_yn "Install Docker Engine (official apt repo, not snap)?" y INSTALL_DOCKER
-    ask_yn "Install Podman (rootless containers, Ubuntu archive)?" n INSTALL_PODMAN
-    ask_yn "Install KVM/libvirt headless virtualization (qemu, libvirt, virtinst)?" n INSTALL_VIRT
+    ask_yn "Install Docker Engine (official apt repo, not snap)?" y INSTALL_DOCKER docker-ce
+    ask_yn "Install Podman (rootless containers, Ubuntu archive)?" n INSTALL_PODMAN podman
+    ask_yn "Install KVM/libvirt headless virtualization (qemu, libvirt, virtinst)?" n INSTALL_VIRT libvirt-daemon-system
 
     echo ""
     echo "  [System health & updates]"
-    ask_yn "Install disk/pool health monitoring (smartmontools, ZED mail, monthly scrub)?" y INSTALL_HEALTH
-    ask_yn "Enable unattended security upgrades (snapshot is taken by the existing apt hook)?" y INSTALL_UNATTENDED
+    ask_yn "Install disk/pool health monitoring (smartmontools, ZED mail, monthly scrub)?" y INSTALL_HEALTH smartmontools
+    ask_yn "Enable unattended security upgrades (snapshot is taken by the existing apt hook)?" y INSTALL_UNATTENDED unattended-upgrades
 
     if [[ "$INSTALL_HEALTH" == "y" || "$INSTALL_UNATTENDED" == "y" ]]; then
         prompt_admin_email
-        ask_yn "Configure an SMTP relay (msmtp) so this mail actually leaves the machine?" y INSTALL_MTA
+        ask_yn "Configure an SMTP relay (msmtp) so this mail actually leaves the machine?" y INSTALL_MTA msmtp
         if [[ "$INSTALL_MTA" == "y" ]]; then
             prompt_smtp_relay
         else
@@ -1414,12 +1414,15 @@ prompt_postreboot_software() {
 
     echo ""
     echo "  [Remote access & security]"
-    ask_yn "Install Tailscale (mesh VPN)?" n INSTALL_TAILSCALE
+    ask_yn "Install Tailscale (mesh VPN)?" n INSTALL_TAILSCALE tailscale
     if [[ "$INSTALL_TAILSCALE" == "y" ]]; then
         read -rsp "    Tailscale auth key (tskey-…, empty = run 'tailscale up' manually later): " TAILSCALE_AUTHKEY
         echo ""
     fi
-    ask_yn "Harden SSH (key-only login, no root login)?" n HARDEN_SSH
+    # Not a package — the drop-in this script writes is the marker
+    local ssh_default="n"
+    if [[ -f /etc/ssh/sshd_config.d/10-zbm-hardening.conf ]]; then ssh_default="y"; fi
+    ask_yn "Harden SSH (key-only login, no root login)?" "$ssh_default" HARDEN_SSH
     if [[ "$HARDEN_SSH" == "y" ]]; then
         local akeys
         akeys="$(getent passwd "$USERNAME" | cut -d: -f6)/.ssh/authorized_keys"
@@ -1434,21 +1437,21 @@ prompt_postreboot_software() {
             HARDEN_SSH_FORCE="y"
         fi
     fi
-    ask_yn "Install ufw host firewall (default deny incoming)?" n INSTALL_UFW
-    ask_yn "Install fail2ban (SSH brute-force protection)?" n INSTALL_FAIL2BAN
-    ask_yn "Install NUT (UPS monitoring / clean shutdown on power loss)?" n INSTALL_NUT
-    ask_yn "Install Cockpit web administration (https://<host>:9090)?" n INSTALL_COCKPIT
+    ask_yn "Install ufw host firewall (default deny incoming)?" n INSTALL_UFW ufw
+    ask_yn "Install fail2ban (SSH brute-force protection)?" n INSTALL_FAIL2BAN fail2ban
+    ask_yn "Install NUT (UPS monitoring / clean shutdown on power loss)?" n INSTALL_NUT nut-server
+    ask_yn "Install Cockpit web administration (https://<host>:9090)?" n INSTALL_COCKPIT cockpit
 
     echo ""
     echo "  [File & monitoring services]"
-    ask_yn "Install Samba (SMB/CIFS file server)?" n INSTALL_SAMBA
-    ask_yn "Install NFS server?" n INSTALL_NFS
-    ask_yn "Install prometheus-node-exporter (metrics on :9100)?" n INSTALL_NODEEXP
-    ask_yn "Install netdata (dashboard on :19999)?" n INSTALL_NETDATA
+    ask_yn "Install Samba (SMB/CIFS file server)?" n INSTALL_SAMBA samba
+    ask_yn "Install NFS server?" n INSTALL_NFS nfs-kernel-server
+    ask_yn "Install prometheus-node-exporter (metrics on :9100)?" n INSTALL_NODEEXP prometheus-node-exporter
+    ask_yn "Install netdata (dashboard on :19999)?" n INSTALL_NETDATA netdata
 
     echo ""
     echo "  [Shell tools]"
-    ask_yn "Install shell toolbelt (git, rsync, jq, tree, fzf, ripgrep, bat, unzip)?" y INSTALL_TOOLBELT
+    ask_yn "Install shell toolbelt (git, rsync, jq, tree, fzf, ripgrep, bat, unzip)?" y INSTALL_TOOLBELT ripgrep
 
     # fail2ban and unattended-upgrades mail to the admin too — make sure the
     # address exists even when health monitoring itself was declined
@@ -1459,12 +1462,36 @@ prompt_postreboot_software() {
     return 0
 }
 
-# ask_yn <question> <default: y|n> <variable name>
+# True when dpkg reports the package as installed (not merely known).
+pkg_installed() {
+    [[ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" == "installed" ]]
+}
+
+# ask_yn <question> <default: y|n> <variable name> [package …]
 # Writes "y" or "n" into the named variable. Empty input takes the default.
+#
+# The default is not blindly the built-in one — a re-run must not propose to
+# undo what the last run did:
+#   1. an answer carried over from zbm-installer.conf wins, then
+#   2. a package that is already installed defaults the answer to "y".
+# Either way an already-present component is marked "(installed)".
 ask_yn() {
-    local question="$1" default="$2" varname="$3" input hint
+    local question="$1" default="$2" varname="$3"
+    shift 3
+    local input hint tag="" pkg
+    local current="${!varname:-}"
+
+    for pkg in "$@"; do
+        if pkg_installed "$pkg"; then
+            tag=" (installed)"
+            default="y"
+            break
+        fi
+    done
+    if [[ "$current" == "y" || "$current" == "n" ]]; then default="$current"; fi
+
     if [[ "$default" == "y" ]]; then hint="[Y/n]"; else hint="[y/N]"; fi
-    read -rp "    $question $hint: " input
+    read -rp "    $question$tag $hint: " input
     if [[ -z "$input" ]]; then
         printf -v "$varname" '%s' "$default"
     elif [[ "$input" =~ ^[Yy] ]]; then
@@ -1472,6 +1499,39 @@ ask_yn() {
     else
         printf -v "$varname" '%s' "n"
     fi
+}
+
+# Writes NAME="value" into zbm-installer.conf, replacing an existing line so
+# the file never grows duplicates. Values are plain identifiers, paths and
+# addresses; secrets are never passed in — the SMTP password lives only in
+# /etc/msmtprc.
+persist_conf_var() {
+    local name="$1" value="$2" conf="${INSTALL_CONF:-}"
+    [[ -n "$conf" && -f "$conf" ]] || return 0
+    if grep -q "^${name}=" "$conf"; then
+        local esc
+        esc=$(printf '%s' "$value" | sed 's/[&|\\]/\\&/g')
+        sed -i "s|^${name}=.*|${name}=\"${esc}\"|" "$conf"
+    else
+        printf '%s="%s"\n' "$name" "$value" >> "$conf"
+    fi
+}
+
+# Persists the software selection so a later postreboot run proposes what this
+# run actually did instead of falling back to the built-in defaults, and so the
+# chosen storage pool stays stable when a second pool appears later.
+persist_postreboot_selection() {
+    local v
+    for v in INSTALL_DOCKER INSTALL_PODMAN INSTALL_VIRT INSTALL_HEALTH \
+             INSTALL_UNATTENDED INSTALL_MTA INSTALL_TAILSCALE HARDEN_SSH \
+             HARDEN_SSH_FORCE INSTALL_UFW INSTALL_FAIL2BAN INSTALL_NUT \
+             INSTALL_COCKPIT INSTALL_SAMBA INSTALL_NFS INSTALL_NODEEXP \
+             INSTALL_NETDATA INSTALL_TOOLBELT ADMIN_EMAIL SMTP_HOST SMTP_PORT \
+             SMTP_USER MAIL_FROM STORAGE_POOL STORAGE_BASE DOCKER_DATA_ROOT \
+             VIRT_STORAGE_DIR; do
+        persist_conf_var "$v" "${!v:-}"
+    done
+    echo "  ✓ Software selection saved to $INSTALL_CONF (the SMTP password is not stored there)"
 }
 
 # Destination address for smartd, ZED, fail2ban and unattended-upgrades mail.
@@ -1498,18 +1558,33 @@ prompt_admin_email() {
 # SMTP relay details for msmtp. The password is kept in memory and written only
 # to /etc/msmtprc (mode 600) — never to zbm-installer.conf or a temp file.
 prompt_smtp_relay() {
-    while [[ -z "$SMTP_HOST" ]]; do
-        read -rp "    SMTP relay host (e.g. smtp.example.com): " SMTP_HOST
+    local input keep_hint=""
+    # Values carried over from zbm-installer.conf are offered as defaults; the
+    # password is never persisted, so an empty answer means "keep the one that
+    # is already in /etc/msmtprc"
+    [[ -f /etc/msmtprc ]] && keep_hint=" (empty = keep the current one)"
+
+    while true; do
+        read -rp "    SMTP relay host${SMTP_HOST:+ [$SMTP_HOST]}: " input
+        if [[ -n "$input" ]]; then SMTP_HOST="$input"; fi
+        if [[ -n "$SMTP_HOST" ]]; then break; fi
+        echo "    A relay host is required."
     done
-    read -rp "    SMTP port [587 = STARTTLS, 465 = implicit TLS] (587): " SMTP_PORT
-    [[ -z "$SMTP_PORT" ]] && SMTP_PORT="587"
-    :
-    read -rp "    SMTP username: " SMTP_USER
-    read -rsp "    SMTP password: " SMTP_PASS
+
+    read -rp "    SMTP port [587 = STARTTLS, 465 = implicit TLS] (${SMTP_PORT:-587}): " input
+    if [[ -n "$input" ]]; then SMTP_PORT="$input"; fi
+    if [[ -z "$SMTP_PORT" ]]; then SMTP_PORT="587"; fi
+
+    read -rp "    SMTP username${SMTP_USER:+ [$SMTP_USER]}: " input
+    if [[ -n "$input" ]]; then SMTP_USER="$input"; fi
+
+    read -rsp "    SMTP password${keep_hint}: " input
     echo ""
-    read -rp "    Sender address (From:) [${SMTP_USER:-root@$HOSTNAME}]: " MAIL_FROM
-    [[ -z "$MAIL_FROM" ]] && MAIL_FROM="${SMTP_USER:-root@$HOSTNAME}"
-    :
+    if [[ -n "$input" ]]; then SMTP_PASS="$input"; fi
+
+    local from_default="${MAIL_FROM:-${SMTP_USER:-root@$HOSTNAME}}"
+    read -rp "    Sender address (From:) [$from_default]: " input
+    MAIL_FROM="${input:-$from_default}"
 }
 
 # Picks the pool that receives the software datasets (docker/virtmanager).
@@ -1598,8 +1673,14 @@ create_software_datasets() {
 
         # storage: external volume data mounted into containers
         #   default recordsize (128K) suits mixed file sizes
+        #   xattr/acltype are set explicitly here too — the pool-level defaults
+        #   only exist on datapools this script created, not on rpool or on an
+        #   imported pool
         zfs list "$pool/docker/storage" &>/dev/null || \
-            zfs create "$pool/docker/storage"
+            zfs create \
+                -o xattr=sa \
+                -o acltype=posixacl \
+                "$pool/docker/storage"
 
         # stack: docker-compose files (small text files)
         #   recordsize=4K — minimises wasted space for tiny config files
@@ -1824,6 +1905,15 @@ install_mta_postreboot() {
 
     local starttls="on"
     if [[ "$SMTP_PORT" == "465" ]]; then starttls="off"; fi
+
+    # The password is not kept in zbm-installer.conf, so on a re-run with an
+    # empty answer it is recovered from the file it was written to
+    if [[ -z "$SMTP_PASS" && -f /etc/msmtprc ]]; then
+        SMTP_PASS=$(awk '$1 == "password" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' /etc/msmtprc)
+    fi
+    if [[ -z "$SMTP_PASS" ]]; then
+        echo "  ⚠ No SMTP password available — msmtp will not be able to authenticate."
+    fi
 
     # 0600 + root:root — this file holds the relay password in cleartext, which
     # is unavoidable for an unattended MTA
@@ -3351,14 +3441,28 @@ elif [[ "$MODE" == "postreboot" ]]; then
         echo ""
         echo "Step 2: Setting up datapool '$DATAPOOL_NAME'..."
 
-        # Offer importing an existing pool first. On import DATAPOOL_NAME and
-        # DATAPOOL_MOUNTPOINT are taken from the imported pool and the creation
-        # block below skips via its zpool-list check.
-        if offer_datapool_import; then
+        # A re-run finds the pool already imported. Neither branch below can
+        # cope with that: offer_datapool_import() only lists *importable* pools
+        # (so it returns 1), and the topology menu would then ask which disks to
+        # build a pool that already exists from — or, with no free disks left,
+        # push the "continue without a datapool" prompt that drops the Sanoid
+        # section for it.
+        if zpool list "$DATAPOOL_NAME" &>/dev/null; then
+            echo "  ✓ Datapool '$DATAPOOL_NAME' is already imported — skipping selection"
+            _mp=$(zfs get -H -o value mountpoint "$DATAPOOL_NAME")
+            if [[ "$_mp" == /* ]] && [[ "$_mp" != "$DATAPOOL_MOUNTPOINT" ]]; then
+                echo "  - Mountpoint is $_mp (conf said ${DATAPOOL_MOUNTPOINT:-unset})"
+                DATAPOOL_MOUNTPOINT="$_mp"
+                persist_conf_var DATAPOOL_MOUNTPOINT "$DATAPOOL_MOUNTPOINT"
+            fi
+        # Otherwise offer importing an existing pool first. On import
+        # DATAPOOL_NAME and DATAPOOL_MOUNTPOINT are taken from the imported pool
+        # and the creation block below skips via its zpool-list check.
+        elif offer_datapool_import; then
             # Persist the (possibly different) pool name/mountpoint so re-runs
             # of postreboot find the imported pool instead of trying to create
-            sed -i "s|^DATAPOOL_NAME=.*|DATAPOOL_NAME=\"$DATAPOOL_NAME\"|" "$INSTALL_CONF"
-            sed -i "s|^DATAPOOL_MOUNTPOINT=.*|DATAPOOL_MOUNTPOINT=\"$DATAPOOL_MOUNTPOINT\"|" "$INSTALL_CONF"
+            persist_conf_var DATAPOOL_NAME "$DATAPOOL_NAME"
+            persist_conf_var DATAPOOL_MOUNTPOINT "$DATAPOOL_MOUNTPOINT"
         # Select topology interactively; sets DATAPOOL_TOPOLOGY and DATAPOOL_DISK_IDS.
         # Returns 1 when no suitable extra disks exist (separate-disks mode).
         elif ! select_datapool_topology_and_disks; then
@@ -3372,6 +3476,26 @@ elif [[ "$MODE" == "postreboot" ]]; then
     fi
 
     if [[ -n "$DATAPOOL_NAME" ]]; then
+        # Properties the datapool gets on creation, mirroring rpool (Step 3 of
+        # the initial phase) so a datapool is not the poor relation:
+        #   autotrim    — SSDs stay fast; a no-op on spinning disks
+        #   acltype/xattr — required by Docker's overlay2 and cheap everywhere
+        #                   else; set here so every child dataset inherits them
+        #   dnodesize   — matches xattr=sa
+        # normalization=formD is deliberately NOT copied from rpool: it implies
+        # utf8only=on, which would reject filenames that Samba/NFS clients are
+        # allowed to create. These are creation-time defaults only — an existing
+        # pool that gets imported is left exactly as the user made it.
+        DATAPOOL_PROPS=(
+            -o autotrim=on
+            -O compression="${COMPRESSION}"
+            -O atime="$ZFS_ATIME"
+            -O relatime="$ZFS_RELATIME"
+            -O acltype=posixacl
+            -O xattr=sa
+            -O dnodesize=auto
+        )
+
         # Create mount point
         echo "  - Creating mount point: $DATAPOOL_MOUNTPOINT"
         mkdir -p "$DATAPOOL_MOUNTPOINT"
@@ -3392,8 +3516,7 @@ elif [[ "$MODE" == "postreboot" ]]; then
                 fi
                 confirm_labelclear "$DISK_DATAPOOL_ID"
                 zpool create -f -o ashift=$ASHIFT \
-                             -O compression=${COMPRESSION} \
-                             -O atime=$ZFS_ATIME \
+                             "${DATAPOOL_PROPS[@]}" \
                              -O mountpoint="$DATAPOOL_MOUNTPOINT" \
                              "$DATAPOOL_NAME" "$DISK_DATAPOOL_ID"
                 echo "  ✓ Datapool '$DATAPOOL_NAME' (single whole disk) created at $DATAPOOL_MOUNTPOINT"
@@ -3409,8 +3532,7 @@ elif [[ "$MODE" == "postreboot" ]]; then
                 DISK_DATAPOOL_ID=$(resolve_part_byid "$DATAPOOL_PARTITION")
                 echo "  - Using partition: $DISK_DATAPOOL_ID"
                 zpool create -f -o ashift=$ASHIFT \
-                             -O compression=${COMPRESSION} \
-                             -O atime=$ZFS_ATIME \
+                             "${DATAPOOL_PROPS[@]}" \
                              -O mountpoint="$DATAPOOL_MOUNTPOINT" \
                              "$DATAPOOL_NAME" "$DISK_DATAPOOL_ID"
                 echo "  ✓ Datapool '$DATAPOOL_NAME' (single) created at $DATAPOOL_MOUNTPOINT"
@@ -3433,8 +3555,7 @@ elif [[ "$MODE" == "postreboot" ]]; then
             confirm_labelclear "${DATAPOOL_DISK_IDS[@]}"
 
             zpool create -f -o ashift=$ASHIFT \
-                         -O compression=${COMPRESSION} \
-                         -O atime=$ZFS_ATIME \
+                         "${DATAPOOL_PROPS[@]}" \
                          -O mountpoint="$DATAPOOL_MOUNTPOINT" \
                          "$DATAPOOL_NAME" "$DATAPOOL_TOPOLOGY" "${DATAPOOL_DISK_IDS[@]}"
             echo "  ✓ Datapool '$DATAPOOL_NAME' ($DATAPOOL_TOPOLOGY) created at $DATAPOOL_MOUNTPOINT"
@@ -3600,6 +3721,7 @@ EOF
     # mode auto-detection pointing at postreboot for a re-run
     echo ""
     echo "Step 22: Recording postreboot completion..."
+    persist_postreboot_selection
     if grep -q '^POSTREBOOT_DONE=' "$INSTALL_CONF"; then
         sed -i 's/^POSTREBOOT_DONE=.*/POSTREBOOT_DONE="y"/' "$INSTALL_CONF"
     else
