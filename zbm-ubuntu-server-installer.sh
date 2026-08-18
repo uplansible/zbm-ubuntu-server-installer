@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.52
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.53
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -79,6 +79,9 @@ INSTALL_NODEEXP=""   # y/n — prometheus-node-exporter on :9100
 INSTALL_NETDATA=""   # y/n — netdata dashboard on :19999
 INSTALL_TOOLBELT=""  # y/n — git, rsync, jq, tree, fzf, ripgrep, bat, unzip
 POSTREBOOT_DONE="n"  # flipped to "y" in zbm-installer.conf when postreboot completes
+STORAGE_POOL=""      # pool that holds the docker/virtmanager datasets; set by select_storage_pool()
+STORAGE_BASE=""      # its mountpoint ("" when the pool is rpool)
+DOCKER_REPOINT=""    # y/n — move an existing Docker data-root onto the new dataset
 DOCKER_DATA_ROOT=""  # set by create_software_datasets()
 VIRT_STORAGE_DIR=""  # set by create_software_datasets()
 APT_UPDATED=0        # guard so apt_refresh() only updates package lists once per run
@@ -551,20 +554,53 @@ select_disk() {
 # Sets: DATAPOOL_TOPOLOGY  (single / mirror / raidz1 / raidz2 / raidz3)
 #       DATAPOOL_DISK_IDS  (array of by-id/by-partuuid paths; empty for single)
 select_datapool_topology_and_disks() {
+    # Disks that already belong to an imported pool are unusable: `zpool create`
+    # refuses them ("is part of active pool"), but it does so only after the
+    # whole topology and disk selection is done. Map them here so the menu can
+    # say why up front. `zpool status -P` prints full device paths; the leading
+    # /dev/disk/by-id symlinks are resolved back to their kernel names.
+    local -a busy_names=()
+    local _line _dev _base _pool_of_dev
+    while IFS= read -r _line; do
+        _dev=$(awk '{print $1}' <<< "$_line")
+        [[ "$_dev" == /* ]] || continue
+        _base=$(basename "$(readlink -f "$_dev" 2>/dev/null || echo "$_dev")")
+        # partition -> parent disk (sda3 -> sda, nvme0n1p3 -> nvme0n1)
+        _base=$(lsblk -no PKNAME "/dev/$_base" 2>/dev/null | head -1 || true)
+        [[ -n "$_base" ]] && busy_names+=("$_base")
+    done < <(zpool status -LP 2>/dev/null || true)
+
     # Collect whole block devices that are NOT the install disk
-    local -a extra_names extra_sizes extra_models
+    local -a extra_names extra_sizes extra_models extra_busy
     while IFS= read -r line; do
-        local name size model
+        local name size model busy
         name=$(awk '{print $1}' <<< "$line")
         size=$(awk '{print $2}' <<< "$line")
         model=$(awk '{$1=$2=""; print $0}' <<< "$line" | sed 's/^ *//')
         [[ "/dev/$name" == "$DISK" ]] && continue
+        busy="no"
+        for _base in ${busy_names[@]+"${busy_names[@]}"}; do
+            [[ "$_base" == "$name" ]] && { busy="yes"; break; }
+        done
         extra_names+=("$name")
         extra_sizes+=("$size")
         extra_models+=("$model")
+        extra_busy+=("$busy")
     done < <(lsblk -d -o NAME,SIZE,MODEL --noheadings | grep -v '^loop\|^sr')
 
-    local n_extra=${#extra_names[@]}
+    # Only disks that are not already claimed by an imported pool can be used,
+    # so the topology menu below must be sized by that count, not by the raw
+    # number of extra disks
+    local -a usable_indices=()
+    local _i
+    for _i in ${extra_names[@]+"${!extra_names[@]}"}; do
+        if [[ "${extra_busy[$_i]}" == "yes" ]]; then
+            echo "  (skipping /dev/${extra_names[$_i]} — already part of an imported ZFS pool)"
+        else
+            usable_indices+=("$_i")
+        fi
+    done
+    local n_extra=${#usable_indices[@]}
 
     # In separate-disks mode every topology (including "single") needs at least
     # one extra whole disk — without this guard the selection loop below would
@@ -610,7 +646,7 @@ select_datapool_topology_and_disks() {
 
     local topo_choice
     while true; do
-        read -rp "Select topology [1-${#topo_labels[@]}]: " topo_choice
+        ask_read "Select topology [1-${#topo_labels[@]}]: " topo_choice
         if [[ "$topo_choice" =~ ^[0-9]+$ ]] && \
            [[ "$topo_choice" -ge 1 ]] && [[ "$topo_choice" -le ${#topo_labels[@]} ]]; then
             break
@@ -644,10 +680,24 @@ select_datapool_topology_and_disks() {
 
     local -a selected_devs
     local count=0
-    local -a avail_indices
-    for i in "${!extra_names[@]}"; do avail_indices+=("$i"); done
+    local -a avail_indices=()
+    for i in ${usable_indices[@]+"${usable_indices[@]}"}; do avail_indices+=("$i"); done
 
     while true; do
+        # Every disk taken. Without this the "Add another disk?" prompt below
+        # could still be answered "y" and the selection loop would then ask
+        # "Select disk number [1-0]" forever.
+        if (( ${#avail_indices[@]} == 0 )); then
+            if (( count < min_disks )); then
+                echo ""
+                echo "Error: only $count disk(s) available for a $DATAPOOL_TOPOLOGY pool (need $min_disks)."
+                return 1
+            fi
+            echo ""
+            echo "All available disks are selected."
+            break
+        fi
+
         echo ""
         echo "Available extra disks:"
         local -a menu_map=()
@@ -664,14 +714,14 @@ select_datapool_topology_and_disks() {
             # "single" topology in separate-disks mode: exactly 1 disk, never ask for more
             [[ "$DATAPOOL_TOPOLOGY" == "single" ]] && break
             local more
-            read -rp "Add another disk? [y/N]: " more
+            ask_read "Add another disk? [y/N]: " more
             [[ ! "$more" =~ ^[Yy]$ ]] && break
         fi
 
         local n_avail=${#avail_indices[@]}
         local choice
         while true; do
-            read -rp "Select disk number [1-${n_avail}]: " choice
+            ask_read "Select disk number [1-${n_avail}]: " choice
             if [[ "$choice" =~ ^[0-9]+$ ]] && \
                [[ "$choice" -ge 1 ]] && [[ "$choice" -le $n_avail ]]; then
                 break
@@ -705,8 +755,11 @@ select_datapool_topology_and_disks() {
 confirm_labelclear() {
     local dev _clear_it
     for dev in "$@"; do
-        if zpool import -d "$dev" 2>/dev/null | grep -q "pool:"; then
-            read -rp "  Disk $dev has an existing ZFS label. Clear it? [y/N]: " _clear_it
+        # Captured rather than piped into `grep -q`: pipefail would turn the
+        # producer's SIGPIPE into 141 and hide the label (see also the ZFS
+        # module and scrub-timer checks)
+        if grep -q "pool:" <<< "$(zpool import -d "$dev" 2>/dev/null || true)"; then
+            ask_read "  Disk $dev has an existing ZFS label. Clear it? [y/N]: " _clear_it
             if [[ "$_clear_it" =~ ^[Yy]$ ]]; then
                 zpool labelclear -f "$dev"
             else
@@ -744,7 +797,7 @@ offer_datapool_import() {
 
     local choice
     while true; do
-        read -rp "Import an existing pool as the datapool? [1-$n_opts]: " choice
+        ask_read "Import an existing pool as the datapool? [1-$n_opts]: " choice
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n_opts )); then
             break
         fi
@@ -753,11 +806,12 @@ offer_datapool_import() {
     (( choice == n_opts )) && return 1
 
     local pool="${import_pools[$((choice-1))]}"
+    local _force
     echo "  - Importing pool '$pool'..."
     if ! zpool import "$pool" 2>/dev/null; then
         # Plain import fails when the pool was last used on another system
         # (hostid mismatch) — that needs -f
-        read -rp "  Plain import failed (pool last used on another system?). Force import? [y/N]: " _force
+        ask_read "  Plain import failed (pool last used on another system?). Force import? [y/N]: " _force
         if [[ "$_force" =~ ^[Yy]$ ]]; then
             if ! zpool import -f "$pool"; then
                 echo "Error: Could not import pool '$pool'."
@@ -1354,12 +1408,20 @@ detect_mode() {
     if [[ "$root_fstype" == "zfs" ]]; then
         if [[ -f "$conf" ]] && grep -q '^POSTREBOOT_DONE="y"' "$conf"; then
             echo "Detected: installed system, post-reboot setup already completed."
-            read -rp "Reinstall/update ZFSBootMenu now? [y/N]: " _ans
-            if [[ ! "$_ans" =~ ^[Yy]$ ]]; then
-                echo "Nothing to do."
-                exit 0
-            fi
-            MODE="reinstall-zbm"
+            echo ""
+            echo "  [1] Update ZFSBootMenu to the latest version"
+            echo "  [2] Re-run post-reboot setup (add/adjust optional software)"
+            echo "  [3] Nothing — exit"
+            echo ""
+            while true; do
+                ask_read "Select [1-3]: " _ans
+                case "$_ans" in
+                    1) MODE="reinstall-zbm"; break ;;
+                    2) MODE="postreboot";    break ;;
+                    3) echo "Nothing to do."; exit 0 ;;
+                    *) echo "Invalid selection." ;;
+                esac
+            done
         else
             echo "Detected: installed system, post-reboot setup pending."
             MODE="postreboot"
@@ -1397,6 +1459,17 @@ prompt_postreboot_software() {
     ask_yn "Install Podman (rootless containers, Ubuntu archive)?" n INSTALL_PODMAN podman
     ask_yn "Install KVM/libvirt headless virtualization (qemu, libvirt, virtinst)?" n INSTALL_VIRT libvirt-daemon-system
 
+    # Which pool holds the docker/virtmanager datasets, and — when Docker is
+    # already installed — whether its data-root may be moved there. Both used to
+    # be asked in the middle of the install steps, which broke the promise made
+    # at the top of this function.
+    if [[ "$INSTALL_DOCKER" == "y" || "$INSTALL_VIRT" == "y" ]]; then
+        select_storage_pool
+        if [[ "$INSTALL_DOCKER" == "y" ]] && command -v docker &>/dev/null; then
+            prompt_docker_repoint "$STORAGE_BASE/docker/dockerroot"
+        fi
+    fi
+
     echo ""
     echo "  [System health & updates]"
     ask_yn "Install disk/pool health monitoring (smartmontools, ZED mail, monthly scrub)?" y INSTALL_HEALTH smartmontools
@@ -1416,8 +1489,7 @@ prompt_postreboot_software() {
     echo "  [Remote access & security]"
     ask_yn "Install Tailscale (mesh VPN)?" n INSTALL_TAILSCALE tailscale
     if [[ "$INSTALL_TAILSCALE" == "y" ]]; then
-        read -rsp "    Tailscale auth key (tskey-…, empty = run 'tailscale up' manually later): " TAILSCALE_AUTHKEY
-        echo ""
+        ask_read "    Tailscale auth key (tskey-…, empty = run 'tailscale up' manually later): " TAILSCALE_AUTHKEY -s
     fi
     # Not a package — the drop-in this script writes is the marker
     local ssh_default="n"
@@ -1453,13 +1525,47 @@ prompt_postreboot_software() {
     echo "  [Shell tools]"
     ask_yn "Install shell toolbelt (git, rsync, jq, tree, fzf, ripgrep, bat, unzip)?" y INSTALL_TOOLBELT ripgrep
 
-    # fail2ban and unattended-upgrades mail to the admin too — make sure the
-    # address exists even when health monitoring itself was declined
-    if [[ -z "$ADMIN_EMAIL" ]] && [[ "$INSTALL_FAIL2BAN" == "y" ]]; then
+    # The relay question above only fires when health or unattended-upgrades was
+    # picked. fail2ban mails the admin too, and a re-run may already carry
+    # INSTALL_MTA="y" in the conf — in both cases Step 8 would otherwise
+    # (re)configure msmtp from stale values without ever asking. Ask here.
+    if [[ "$INSTALL_HEALTH" != "y" && "$INSTALL_UNATTENDED" != "y" ]] \
+       && [[ "$INSTALL_FAIL2BAN" == "y" || "$INSTALL_MTA" == "y" ]]; then
+        echo ""
+        echo "  [Mail relay]"
         prompt_admin_email
+        ask_yn "Configure an SMTP relay (msmtp) so this mail actually leaves the machine?" y INSTALL_MTA msmtp
+        if [[ "$INSTALL_MTA" == "y" ]]; then
+            prompt_smtp_relay
+        else
+            echo "    Note: without an MTA the alert mail stays in the local root mailbox."
+        fi
     fi
+
     [[ -z "$ADMIN_EMAIL" ]] && ADMIN_EMAIL="root"
     return 0
+}
+
+# read wrapper for the "ask again until valid" menus. A bare `read` inside an
+# unbounded loop spins forever the moment stdin hits EOF (script piped in, no
+# terminal, answers exhausted) — printing "Invalid selection." at full speed.
+# Treat EOF as fatal instead.
+# Usage: ask_read <prompt> <variable name> [-s]
+ask_read() {
+    local _prompt="$1" _var="$2" _silent="${3:-}" _val
+    if [[ "$_silent" == "-s" ]]; then
+        if ! IFS= read -rsp "$_prompt" _val; then
+            echo ""
+            echo "Error: end of input — this script needs an interactive terminal."
+            exit 1
+        fi
+        echo ""
+    elif ! IFS= read -rp "$_prompt" _val; then
+        echo ""
+        echo "Error: end of input — this script needs an interactive terminal."
+        exit 1
+    fi
+    printf -v "$_var" '%s' "$_val"
 }
 
 # True when dpkg reports the package as installed (not merely known).
@@ -1491,7 +1597,7 @@ ask_yn() {
     if [[ "$current" == "y" || "$current" == "n" ]]; then default="$current"; fi
 
     if [[ "$default" == "y" ]]; then hint="[Y/n]"; else hint="[y/N]"; fi
-    read -rp "    $question$tag $hint: " input
+    ask_read "    $question$tag $hint: " input
     if [[ -z "$input" ]]; then
         printf -v "$varname" '%s' "$default"
     elif [[ "$input" =~ ^[Yy] ]]; then
@@ -1542,7 +1648,7 @@ prompt_admin_email() {
     fi
     local input
     while true; do
-        read -rp "    Admin e-mail for alerts (empty = local 'root' mailbox): " input
+        ask_read "    Admin e-mail for alerts (empty = local 'root' mailbox): " input
         if [[ -z "$input" ]]; then
             ADMIN_EMAIL="root"
             return 0
@@ -1565,25 +1671,24 @@ prompt_smtp_relay() {
     [[ -f /etc/msmtprc ]] && keep_hint=" (empty = keep the current one)"
 
     while true; do
-        read -rp "    SMTP relay host${SMTP_HOST:+ [$SMTP_HOST]}: " input
+        ask_read "    SMTP relay host${SMTP_HOST:+ [$SMTP_HOST]}: " input
         if [[ -n "$input" ]]; then SMTP_HOST="$input"; fi
         if [[ -n "$SMTP_HOST" ]]; then break; fi
         echo "    A relay host is required."
     done
 
-    read -rp "    SMTP port [587 = STARTTLS, 465 = implicit TLS] (${SMTP_PORT:-587}): " input
+    ask_read "    SMTP port [587 = STARTTLS, 465 = implicit TLS] (${SMTP_PORT:-587}): " input
     if [[ -n "$input" ]]; then SMTP_PORT="$input"; fi
     if [[ -z "$SMTP_PORT" ]]; then SMTP_PORT="587"; fi
 
-    read -rp "    SMTP username${SMTP_USER:+ [$SMTP_USER]}: " input
+    ask_read "    SMTP username${SMTP_USER:+ [$SMTP_USER]}: " input
     if [[ -n "$input" ]]; then SMTP_USER="$input"; fi
 
-    read -rsp "    SMTP password${keep_hint}: " input
-    echo ""
+    ask_read "    SMTP password${keep_hint}: " input -s
     if [[ -n "$input" ]]; then SMTP_PASS="$input"; fi
 
     local from_default="${MAIL_FROM:-${SMTP_USER:-root@$HOSTNAME}}"
-    read -rp "    Sender address (From:) [$from_default]: " input
+    ask_read "    Sender address (From:) [$from_default]: " input
     MAIL_FROM="${input:-$from_default}"
 }
 
@@ -1596,6 +1701,26 @@ prompt_smtp_relay() {
 select_storage_pool() {
     local -a pools=() bases=()
     local p mp
+
+    # A choice carried over from zbm-installer.conf wins as long as that pool is
+    # still imported and still usable. Without this a datapool appearing (or
+    # being exported) between two runs would silently move the docker/libvirt
+    # target pool — which is exactly what this function is meant to prevent.
+    if [[ -n "$STORAGE_POOL" ]] && zpool list "$STORAGE_POOL" &>/dev/null; then
+        if [[ "$STORAGE_POOL" == "rpool" ]]; then
+            STORAGE_BASE=""
+            echo "  ✓ Keeping the previously chosen storage pool: rpool (/docker, /virtmanager)"
+            return 0
+        fi
+        mp=$(zfs get -H -o value mountpoint "$STORAGE_POOL")
+        if [[ "$mp" == /* ]]; then
+            STORAGE_BASE="$mp"
+            echo "  ✓ Keeping the previously chosen storage pool: $STORAGE_POOL (mounted at $mp)"
+            return 0
+        fi
+        echo "  (previous storage pool '$STORAGE_POOL' has mountpoint '$mp' — choosing again)"
+    fi
+
     while IFS= read -r p; do
         [[ "$p" == "rpool" ]] && continue
         mp=$(zfs get -H -o value mountpoint "$p")
@@ -1622,7 +1747,7 @@ select_storage_pool() {
         done
         printf "  %d) %-16s (system pool; datasets mount at /docker, /virtmanager)\n" "$n_opts" "rpool"
         while true; do
-            read -rp "Select pool [1-$n_opts]: " choice
+            ask_read "Select pool [1-$n_opts]: " choice
             if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n_opts )); then
                 break
             fi
@@ -1719,9 +1844,48 @@ current_docker_data_root() {
         /etc/docker/daemon.json | head -1
 }
 
-# Repoints an already-installed Docker at DOCKER_DATA_ROOT. Existing image and
-# container data is never moved automatically — that is the user's call — so a
-# non-empty current data-root is reported and confirmed first.
+# Asks — during the question phase, not mid-install — whether an already
+# installed Docker may be repointed at the dataset this run will create.
+# Existing image and container data is never moved automatically (that is the
+# user's call), so a non-empty current data-root is reported first.
+# Usage: prompt_docker_repoint <target data-root>
+# Sets: DOCKER_REPOINT (y/n)
+prompt_docker_repoint() {
+    local target="$1" current effective
+    current=$(current_docker_data_root)
+    effective="${current:-/var/lib/docker}"
+
+    if [[ "$effective" == "$target" ]]; then
+        DOCKER_REPOINT="n"
+        return 0    # already there; nothing to ask
+    fi
+
+    # Cleared so ask_yn() falls through to the built-in default below instead of
+    # treating a value left over from an earlier call as the carried-over answer
+    DOCKER_REPOINT=""
+
+    echo ""
+    echo "    Docker is already installed with data-root: $effective"
+    echo "    The datasets this run creates expect:       $target"
+
+    # Anything beyond an empty dir means images/containers/volumes would become
+    # invisible after the switch
+    local has_data="no"
+    if [[ -d "$effective" ]] && [[ -n "$(ls -A "$effective" 2>/dev/null)" ]]; then
+        has_data="yes"
+        echo "    ⚠ $effective is NOT empty — existing images, containers and"
+        echo "      volumes will become invisible until you migrate them, e.g.:"
+        echo "        systemctl stop docker && rsync -aHAX $effective/ $target/"
+    fi
+
+    if [[ "$has_data" == "yes" ]]; then
+        ask_yn "Repoint Docker to $target anyway?" n DOCKER_REPOINT
+    else
+        ask_yn "Repoint Docker to $target?" y DOCKER_REPOINT
+    fi
+}
+
+# Applies the decision taken by prompt_docker_repoint(). Runs unattended.
 repoint_existing_docker() {
     local current effective
     current=$(current_docker_data_root)
@@ -1732,30 +1896,8 @@ repoint_existing_docker() {
         return 0
     fi
 
-    echo "  - Docker is installed with data-root: $effective"
-    echo "    The datasets created above expect:   $DOCKER_DATA_ROOT"
-
-    # Anything beyond an empty dir means images/containers/volumes would become
-    # invisible after the switch
-    local has_data="no"
-    if [[ -d "$effective" ]] && [[ -n "$(ls -A "$effective" 2>/dev/null)" ]]; then
-        has_data="yes"
-        echo "    ⚠ $effective is NOT empty — existing images, containers and"
-        echo "      volumes will become invisible until you migrate them, e.g.:"
-        echo "        systemctl stop docker && rsync -aHAX $effective/ $DOCKER_DATA_ROOT/"
-    fi
-
-    local _ans
-    if [[ "$has_data" == "yes" ]]; then
-        read -rp "  Repoint Docker to $DOCKER_DATA_ROOT anyway? [y/N]: " _ans
-    else
-        read -rp "  Repoint Docker to $DOCKER_DATA_ROOT? [Y/n]: " _ans
-        # Plain `[[ ]] && cmd` would abort the run under set -e whenever the
-        # test fails, i.e. whenever the user actually typed an answer
-        if [[ -z "$_ans" ]]; then _ans="y"; fi
-    fi
-    if [[ ! "$_ans" =~ ^[Yy]$ ]]; then
-        echo "  ✓ Leaving Docker data-root at $effective"
+    if [[ "$DOCKER_REPOINT" != "y" ]]; then
+        echo "  ✓ Leaving Docker data-root at $effective (as answered above)"
         return 0
     fi
 
@@ -1767,8 +1909,14 @@ repoint_existing_docker() {
     "storage-driver": "overlay2"
 }
 DOCKEREOF
-    systemctl start docker
-    echo "  ✓ Docker data-root set to $DOCKER_DATA_ROOT"
+    # Non-fatal: a dockerd that refuses the new data-root must not abort
+    # postreboot before SSH hardening and the firewall have run
+    if systemctl start docker; then
+        echo "  ✓ Docker data-root set to $DOCKER_DATA_ROOT"
+    else
+        echo "  ⚠ Docker did not start with data-root $DOCKER_DATA_ROOT"
+        echo "    Inspect with: journalctl -u docker -n 50"
+    fi
 }
 
 # Installs Docker Engine on the running system. daemon.json (data-root) is
@@ -1778,8 +1926,15 @@ install_docker_postreboot() {
     if command -v docker &>/dev/null; then
         echo "  ✓ Docker already installed — checking data-root"
         repoint_existing_docker
-        # Keep group membership idempotent for re-runs
-        usermod -aG docker "$USERNAME"
+        # Keep group membership idempotent for re-runs. The group is only
+        # guaranteed to exist when docker came from a package that creates it —
+        # a docker binary from a snap or a manual install has none, and an
+        # unguarded usermod would abort the whole run.
+        if getent group docker >/dev/null; then
+            usermod -aG docker "$USERNAME"
+        else
+            echo "  ⚠ No 'docker' group on this system — skipping group membership"
+        fi
         return 0
     fi
 
@@ -1809,8 +1964,11 @@ Architectures: $arch
 Signed-By: /etc/apt/keyrings/docker.asc
 SRCEOF
 
-    # 3. Install — postinst starts dockerd with the daemon.json above
+    # 3. Install — postinst starts dockerd with the daemon.json above.
+    #    The refresh guard is set so the later optional installers do not pay
+    #    for a second `apt update` in the same run.
     apt update
+    APT_UPDATED=1
     apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
     # 4. Group membership (takes effect on next login)
@@ -1828,7 +1986,7 @@ install_virtualization_postreboot() {
     # NAT network cannot start (VMs would have no networking)
     # Package lists may be stale when Docker was not selected (which is what
     # otherwise runs apt update on this boot)
-    apt update
+    apt_refresh
     apt install -y --no-install-recommends \
         qemu-system-x86 \
         libvirt-daemon-system \
@@ -1901,7 +2059,11 @@ strip_managed_block() {
 # unattended-upgrades all expect. Without it their mail rots in the local spool.
 install_mta_postreboot() {
     apt_refresh
-    apt install -y --no-install-recommends msmtp msmtp-mta ca-certificates
+    # bsd-mailx is pulled in here rather than only in the health step: it needs
+    # a mail-transport-agent, msmtp-mta in the same transaction satisfies that,
+    # and without /usr/bin/mail neither ZED (ZED_EMAIL_PROG="mail") nor the test
+    # command printed below would work when health monitoring was declined.
+    apt install -y --no-install-recommends msmtp msmtp-mta ca-certificates bsd-mailx
 
     local starttls="on"
     if [[ "$SMTP_PORT" == "465" ]]; then starttls="off"; fi
@@ -1911,7 +2073,14 @@ install_mta_postreboot() {
     if [[ -z "$SMTP_PASS" && -f /etc/msmtprc ]]; then
         SMTP_PASS=$(awk '$1 == "password" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' /etc/msmtprc)
     fi
-    if [[ -z "$SMTP_PASS" ]]; then
+    # An open/IP-authenticated relay has no credentials at all. Emitting
+    # "auth on" with an empty user/password makes msmtp fail every single send,
+    # so authentication is only switched on when there is a username.
+    local auth="on"
+    if [[ -z "$SMTP_USER" ]]; then
+        auth="off"
+        echo "  - No SMTP username given — configuring the relay without authentication"
+    elif [[ -z "$SMTP_PASS" ]]; then
         echo "  ⚠ No SMTP password available — msmtp will not be able to authenticate."
     fi
 
@@ -1921,7 +2090,7 @@ install_mta_postreboot() {
     cat > /etc/msmtprc << MSMTPEOF
 # Written by zbm-ubuntu-server-installer
 defaults
-auth           on
+auth           $auth
 tls            on
 tls_starttls   $starttls
 tls_trust_file /etc/ssl/certs/ca-certificates.crt
@@ -1932,18 +2101,33 @@ account        default
 host           $SMTP_HOST
 port           $SMTP_PORT
 from           $MAIL_FROM
+MSMTPEOF
+    if [[ "$auth" == "on" ]]; then
+        cat >> /etc/msmtprc << MSMTPAUTHEOF
 user           $SMTP_USER
 password       $SMTP_PASS
-MSMTPEOF
+MSMTPAUTHEOF
+    fi
     chmod 600 /etc/msmtprc
 
-    # Alias map so mail addressed to root (smartd, cron, ZED) is rewritten
-    cat > /etc/aliases << ALIASEOF
+    # Alias map so mail addressed to root (smartd, cron, ZED) is rewritten.
+    # Written as a managed block instead of overwriting the file: /etc/aliases
+    # may already carry entries from packages or the admin, and a plain
+    # `cat >` would delete them on every re-run. msmtp treats '#' as a comment,
+    # so the markers are inert.
+    touch /etc/aliases
+    strip_managed_block /etc/aliases
+    # Also drop bare root:/default: lines written by earlier script versions,
+    # otherwise msmtp would see two mappings for the same name
+    sed -i -E '/^[[:space:]]*(root|default)[[:space:]]*:/d' /etc/aliases
+    cat >> /etc/aliases << ALIASEOF
+$ZBM_BLOCK_START
 root: $ADMIN_EMAIL
 default: $ADMIN_EMAIL
+$ZBM_BLOCK_END
 ALIASEOF
 
-    echo "  ✓ msmtp configured: $SMTP_USER@$SMTP_HOST:$SMTP_PORT → $ADMIN_EMAIL"
+    echo "  ✓ msmtp configured: ${SMTP_USER:+$SMTP_USER@}$SMTP_HOST:$SMTP_PORT → $ADMIN_EMAIL"
     echo "    Test with: echo test | mail -s 'zbm test' $ADMIN_EMAIL"
 }
 
@@ -1967,10 +2151,18 @@ install_health_postreboot() {
     apt install -y --no-install-recommends "${health_pkgs[@]}"
 
     # smartd: short self-test nightly at 02:00, long self-test Saturdays 03:00,
-    # temperature warnings, skip drives that are spun down
-    strip_managed_block /etc/smartd.conf
-    sed -i 's/^DEVICESCAN/#DEVICESCAN/' /etc/smartd.conf
-    cat >> /etc/smartd.conf << SMARTDEOF
+    # temperature warnings, skip drives that are spun down.
+    # The config path is looked up rather than assumed — Debian/Ubuntu use
+    # /etc/smartd.conf, upstream moved to /etc/smartmontools/smartd.conf, and an
+    # unguarded `sed -i` on the wrong path would abort the whole phase.
+    local smartd_conf=/etc/smartd.conf
+    if [[ ! -f /etc/smartd.conf ]] && [[ -f /etc/smartmontools/smartd.conf ]]; then
+        smartd_conf=/etc/smartmontools/smartd.conf
+    fi
+    touch "$smartd_conf"
+    strip_managed_block "$smartd_conf"
+    sed -i 's/^DEVICESCAN/#DEVICESCAN/' "$smartd_conf"
+    cat >> "$smartd_conf" << SMARTDEOF
 $ZBM_BLOCK_START
 DEVICESCAN -a -o on -S on -n standby,q -W 4,45,55 -s (S/../.././02|L/../../6/03) -m $ADMIN_EMAIL -M exec /usr/share/smartmontools/smartd-runner
 $ZBM_BLOCK_END
@@ -2002,8 +2194,12 @@ ZEDEOF
         echo "  ⚠ /etc/zfs/zed.d/zed.rc not found — ZED mail not configured"
     fi
 
-    # Monthly scrub for every imported pool (zfsutils-linux ships the template)
-    if systemctl list-unit-files | grep -q '^zfs-scrub-monthly@\.timer'; then
+    # Monthly scrub for every imported pool (zfsutils-linux ships the template).
+    # The pattern is passed to systemctl instead of piping into grep: `grep -q`
+    # exits on the first match, systemctl then dies of SIGPIPE, and `pipefail`
+    # turns that into exit status 141 — so the piped form reported "not
+    # available" even when the template unit was right there.
+    if systemctl list-unit-files --no-legend 'zfs-scrub-monthly@.timer' &>/dev/null; then
         local p
         while IFS= read -r p; do
             systemctl enable --now "zfs-scrub-monthly@${p}.timer" 2>/dev/null \
@@ -2036,14 +2232,16 @@ Unattended-Upgrade::MailReport "on-change";
 Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "false";
 Unattended-Upgrade::Automatic-Reboot "false";
-UUEOF
 
-    cat > /etc/apt/apt.conf.d/20auto-upgrades << AUEOF
+// APT::Periodic lives here rather than in /etc/apt/apt.conf.d/20auto-upgrades:
+// that file is a conffile of the unattended-upgrades package, and overwriting
+// it makes every future package upgrade stop on a dpkg conffile prompt.
+// 52 sorts after 20, so these values win either way.
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
-AUEOF
+UUEOF
 
     systemctl enable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
     echo "  ✓ unattended-upgrades active (security pocket, no auto-reboot, report → $ADMIN_EMAIL)"
@@ -2134,17 +2332,42 @@ harden_ssh_postreboot() {
 }
 
 # --- Host firewall ----------------------------------------------------------
-# Ports are opened from the selection flags, so this can run before the services
-# themselves are installed. SSH is allowed before the firewall is enabled.
-install_ufw_postreboot() {
+# Split in two on purpose:
+#   install_ufw_package()  runs BEFORE fail2ban, so the "banaction = ufw" that
+#                          fail2ban is configured with refers to a command that
+#                          already exists,
+#   enable_ufw_postreboot() runs LAST, so the rule set reflects every service
+#                          the run actually installed.
+install_ufw_package() {
     apt_refresh
     apt install -y --no-install-recommends ufw
+    echo "  ✓ ufw installed (rules and activation come at the end of this run)"
+}
+
+# Ports come from the selection flags, so this works even for services that were
+# installed minutes ago. SSH is allowed before the firewall is switched on.
+enable_ufw_postreboot() {
+    # The listening port is read from the effective sshd config rather than
+    # assumed to be 22 — hardcoding it locks the admin out of a host that runs
+    # sshd anywhere else. Multiple Port lines are all honoured.
+    local -a ssh_ports=()
+    local _p
+    while IFS= read -r _p; do
+        [[ "$_p" =~ ^[0-9]+$ ]] && ssh_ports+=("$_p")
+    done < <(/usr/sbin/sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }' || true)
+    if (( ${#ssh_ports[@]} == 0 )); then
+        ssh_ports=(22)
+        echo "  - Could not read the sshd port (sshd -T) — falling back to 22"
+    fi
 
     # No 'ufw --force reset': a re-run must not wipe rules added by hand later.
     # Every rule below is idempotent.
     ufw default deny incoming >/dev/null
     ufw default allow outgoing >/dev/null
-    ufw allow 22/tcp comment 'SSH' >/dev/null
+    for _p in "${ssh_ports[@]}"; do
+        ufw allow "$_p"/tcp comment 'SSH' >/dev/null
+    done
+    echo "  - SSH allowed on port(s): ${ssh_ports[*]}"
 
     if [[ "$INSTALL_TAILSCALE" == "y" ]]; then ufw allow in on tailscale0 comment 'Tailscale' >/dev/null; fi
     if [[ "$INSTALL_COCKPIT" == "y" ]];   then ufw allow 9090/tcp comment 'Cockpit' >/dev/null; fi
@@ -2172,6 +2395,8 @@ install_fail2ban_postreboot() {
     # python3-systemd is what lets the systemd backend read the journal
     apt install -y --no-install-recommends fail2ban python3-systemd
 
+    # ufw is installed in the step before this one when it was selected, so the
+    # ban action always refers to a command that exists by now
     local banaction="iptables-multiport"
     [[ "$INSTALL_UFW" == "y" ]] && banaction="ufw"
 
@@ -2206,13 +2431,32 @@ install_nut_postreboot() {
     apt_refresh
     apt install -y --no-install-recommends nut-server nut-client
 
-    echo "MODE=standalone" > /etc/nut/nut.conf
-
-    echo "  ✓ NUT installed (MODE=standalone)"
+    # Only touch MODE, and only while it is still the package default. A
+    # re-run must not throw away the ups.conf/upsmon.conf work the user did
+    # after the first run — `> /etc/nut/nut.conf` used to reset the whole file.
+    local cur_mode=""
+    if [[ -f /etc/nut/nut.conf ]]; then
+        cur_mode=$(sed -n 's/^[[:space:]]*MODE=[[:space:]]*\([^[:space:]#]*\).*/\1/p' /etc/nut/nut.conf | tail -1)
+    fi
+    if [[ -z "$cur_mode" || "$cur_mode" == "none" ]]; then
+        if [[ -f /etc/nut/nut.conf ]] && grep -qE '^[[:space:]]*MODE=' /etc/nut/nut.conf; then
+            sed -i -E 's|^[[:space:]]*MODE=.*|MODE=standalone|' /etc/nut/nut.conf
+        else
+            mkdir -p /etc/nut
+            echo "MODE=standalone" >> /etc/nut/nut.conf
+        fi
+        echo "  ✓ NUT installed (MODE=standalone)"
+    else
+        echo "  ✓ NUT installed (existing MODE=$cur_mode kept)"
+    fi
     echo "  - Scanning for a USB UPS..."
-    if command -v nut-scanner &>/dev/null && nut-scanner -q -U 2>/dev/null | grep -q '\['; then
+    local _scan=""
+    if command -v nut-scanner &>/dev/null; then
+        _scan=$(nut-scanner -q -U 2>/dev/null || true)
+    fi
+    if [[ -n "$_scan" ]] && grep -q '\[' <<< "$_scan"; then
         echo ""
-        nut-scanner -q -U 2>/dev/null || true
+        printf '%s\n' "$_scan"
         echo ""
         echo "    Paste the block above into /etc/nut/ups.conf, then:"
     else
@@ -2234,8 +2478,13 @@ install_cockpit_postreboot() {
     if [[ "$INSTALL_PODMAN" == "y" ]]; then pkgs+=(cockpit-podman); fi
     apt install -y --no-install-recommends "${pkgs[@]}"
 
-    systemctl enable --now cockpit.socket
-    echo "  ✓ Cockpit on https://$HOSTNAME:9090 (self-signed certificate; log in as $USERNAME)"
+    # Non-fatal like every other optional service: a Cockpit hiccup must not
+    # abort postreboot before SSH hardening, fail2ban and the firewall have run
+    if systemctl enable --now cockpit.socket 2>/dev/null; then
+        echo "  ✓ Cockpit on https://$HOSTNAME:9090 (self-signed certificate; log in as $USERNAME)"
+    else
+        echo "  ⚠ cockpit.socket could not be enabled — check 'systemctl status cockpit.socket'"
+    fi
     if [[ "$INSTALL_DOCKER" == "y" ]]; then
         echo "    Note: Cockpit has no Docker module — only Podman is supported."
     fi
@@ -2452,9 +2701,12 @@ if [[ "$MODE" == "initial" ]]; then
     # Select fastest apt mirror now that curl is guaranteed to be available
     select_fastest_mirror
 
-    # Verify ZFS module is loaded or can be loaded
+    # Verify ZFS module is loaded or can be loaded.
+    # Read the module list into a variable first: `grep -q` exits at the first
+    # match, lsmod then dies of SIGPIPE, and `pipefail` turns that into exit
+    # status 141 — the piped form can report "not loaded" for a loaded module.
     echo "Verifying ZFS module..."
-    if ! lsmod | grep -q "^zfs "; then
+    if ! grep -q '^zfs ' /proc/modules; then
         echo "ZFS module not loaded, attempting to load..."
         modprobe zfs || {
             echo "Error: Failed to load ZFS module!"
@@ -2473,7 +2725,9 @@ if [[ "$MODE" == "initial" ]]; then
 
     # Check if any partitions on the disk are mounted
     echo "Checking for mounted partitions on $DISK..."
-    if lsblk -no MOUNTPOINT "$DISK" 2>/dev/null | grep -qv '^$'; then
+    # Same SIGPIPE/pipefail trap as above — capture, then test
+    _mounted=$(lsblk -no MOUNTPOINT "$DISK" 2>/dev/null | grep -v '^$' || true)
+    if [[ -n "$_mounted" ]]; then
         echo "Error: Disk $DISK has mounted partitions!"
         echo "Mounted partitions:"
         lsblk -no NAME,MOUNTPOINT "$DISK"
@@ -2486,8 +2740,8 @@ if [[ "$MODE" == "initial" ]]; then
     echo "Checking for existing ZFS labels on $DISK..."
     # Match the disk name and its partitions (sda -> sda3, nvme0n1 -> nvme0n1p1)
     # but not a different disk that merely starts the same way (sda vs sdaa)
-    if zpool import 2>/dev/null \
-        | grep -qE "(^|[^[:alnum:]])$(basename "$DISK")(p?[0-9]+)?([^[:alnum:]]|\$)"; then
+    _importable=$(zpool import 2>/dev/null || true)
+    if grep -qE "(^|[^[:alnum:]])$(basename "$DISK")(p?[0-9]+)?([^[:alnum:]]|\$)" <<< "$_importable"; then
         echo "Warning: Disk $DISK appears to be part of an importable ZFS pool!"
         echo "Proceeding will destroy that pool's data."
         echo "Press Ctrl+C within 10 seconds to abort, or wait to continue..."
@@ -3232,7 +3486,7 @@ EOF
     # Verify EFI boot entry or fallback path exists
     if [[ -f /mnt/boot/efi/EFI/BOOT/BOOTX64.EFI ]]; then
         echo "  ✓ UEFI fallback path present (/EFI/BOOT/BOOTX64.EFI)"
-    elif efibootmgr 2>/dev/null | grep -q "ZFSBootMenu"; then
+    elif grep -q "ZFSBootMenu" <<< "$(efibootmgr 2>/dev/null || true)"; then
         echo "  ✓ EFI boot entry created"
     else
         echo "WARNING: Neither fallback EFI path nor efibootmgr entry found. Manual boot setup may be required."
@@ -3378,8 +3632,11 @@ elif [[ "$MODE" == "postreboot" ]]; then
         source "$INSTALL_CONF"
         echo "  ✓ Loaded installation config from $INSTALL_CONF"
         # The conf does not carry HOSTNAME — take it from the running system so
-        # mail senders and printed URLs show the real name, not the default
-        HOSTNAME="$(hostname)"
+        # mail senders and printed URLs show the real name, not the default.
+        # Short name, lower-cased: validate_inputs() below enforces RFC 1123 and
+        # would abort the whole phase on an FQDN or a mixed-case hostname.
+        HOSTNAME="$(hostname -s 2>/dev/null || hostname)"
+        HOSTNAME="${HOSTNAME,,}"
     else
         echo "Error: $INSTALL_CONF not found."
         echo "postreboot must run from the installer directory created during install:"
@@ -3449,8 +3706,16 @@ elif [[ "$MODE" == "postreboot" ]]; then
         # section for it.
         if zpool list "$DATAPOOL_NAME" &>/dev/null; then
             echo "  ✓ Datapool '$DATAPOOL_NAME' is already imported — skipping selection"
+            # The pool is complete, not half-built: mark it ready immediately so
+            # a failure in the rest of this step (zfs get, conf write, sanoid.conf)
+            # cannot make the ERR trap export a live pool out of zpool.cache.
+            DATAPOOL_READY=1
             _mp=$(zfs get -H -o value mountpoint "$DATAPOOL_NAME")
-            if [[ "$_mp" == /* ]] && [[ "$_mp" != "$DATAPOOL_MOUNTPOINT" ]]; then
+            if [[ "$_mp" != /* ]]; then
+                echo "  ⚠ Pool root mountpoint is '$_mp' — its datasets will not appear"
+                echo "    under ${DATAPOOL_MOUNTPOINT:-/$DATAPOOL_NAME}. Fix with:"
+                echo "      zfs set mountpoint=${DATAPOOL_MOUNTPOINT:-/$DATAPOOL_NAME} $DATAPOOL_NAME"
+            elif [[ "$_mp" != "$DATAPOOL_MOUNTPOINT" ]]; then
                 echo "  - Mountpoint is $_mp (conf said ${DATAPOOL_MOUNTPOINT:-unset})"
                 DATAPOOL_MOUNTPOINT="$_mp"
                 persist_conf_var DATAPOOL_MOUNTPOINT "$DATAPOOL_MOUNTPOINT"
@@ -3466,7 +3731,7 @@ elif [[ "$MODE" == "postreboot" ]]; then
         # Select topology interactively; sets DATAPOOL_TOPOLOGY and DATAPOOL_DISK_IDS.
         # Returns 1 when no suitable extra disks exist (separate-disks mode).
         elif ! select_datapool_topology_and_disks; then
-            read -rp "Continue without a datapool (software datasets will go on rpool)? [y/N]: " _ans
+            ask_read "Continue without a datapool (software datasets will go on rpool)? [y/N]: " _ans
             if [[ ! "$_ans" =~ ^[Yy]$ ]]; then
                 echo "Aborting. Attach the datapool disk(s) and re-run postreboot."
                 exit 1
@@ -3587,13 +3852,8 @@ EOF
     echo "Step 3: Optional software selection..."
     prompt_postreboot_software
 
-    # Storage target for software datasets: single data pool → used directly,
-    # several pools → user chooses, none → rpool fallback
-    STORAGE_POOL="rpool"
-    STORAGE_BASE=""
-
+    # STORAGE_POOL/STORAGE_BASE were chosen during the question phase above
     if [[ "$INSTALL_DOCKER" == "y" || "$INSTALL_VIRT" == "y" ]]; then
-        select_storage_pool
         echo ""
         echo "Step 4: Creating software datasets on $STORAGE_POOL..."
         create_software_datasets "$STORAGE_POOL" "$STORAGE_BASE"
@@ -3698,29 +3958,37 @@ EOF
     fi
 
     # Hardening runs last: SSH first (so a broken config is caught while the
-    # session is still open), then fail2ban, then the firewall that both depend on
+    # session is still open), then the ufw package (fail2ban's ban action needs
+    # the binary), then fail2ban, then the firewall itself — enabled at the very
+    # end so its rule set matches the services this run actually installed.
     if [[ "$HARDEN_SSH" == "y" ]]; then
         echo ""
         echo "Step 19: Hardening SSH..."
         harden_ssh_postreboot
     fi
 
+    if [[ "$INSTALL_UFW" == "y" ]]; then
+        echo ""
+        echo "Step 20: Installing ufw..."
+        install_ufw_package
+    fi
+
     if [[ "$INSTALL_FAIL2BAN" == "y" ]]; then
         echo ""
-        echo "Step 20: Installing fail2ban..."
+        echo "Step 21: Installing fail2ban..."
         install_fail2ban_postreboot
     fi
 
     if [[ "$INSTALL_UFW" == "y" ]]; then
         echo ""
-        echo "Step 21: Enabling the ufw host firewall..."
-        install_ufw_postreboot
+        echo "Step 22: Enabling the ufw host firewall..."
+        enable_ufw_postreboot
     fi
 
     # Written only after everything above succeeded, so a failed run keeps
     # mode auto-detection pointing at postreboot for a re-run
     echo ""
-    echo "Step 22: Recording postreboot completion..."
+    echo "Step 23: Recording postreboot completion..."
     persist_postreboot_selection
     if grep -q '^POSTREBOOT_DONE=' "$INSTALL_CONF"; then
         sed -i 's/^POSTREBOOT_DONE=.*/POSTREBOOT_DONE="y"/' "$INSTALL_CONF"
@@ -3791,7 +4059,7 @@ EOF
         fi
     fi
     if [[ "$INSTALL_UFW" == "y" ]]; then
-        echo "  - ufw active: ufw status verbose"
+        echo "  - ufw active (SSH port taken from the live sshd config): ufw status verbose"
     fi
     if [[ "$INSTALL_FAIL2BAN" == "y" ]]; then
         echo "  - fail2ban active: fail2ban-client status sshd"
@@ -3814,7 +4082,8 @@ EOF
     if [[ "$INSTALL_NFS" == "y" ]]; then
         echo "  - NFS server installed; export with: zfs set sharenfs=... <dataset>"
     fi
-    echo "  - Re-run this script with no argument any time to update ZFSBootMenu"
+    echo "  - Re-run this script with no argument any time: it then offers to update"
+    echo "    ZFSBootMenu or to run this post-reboot setup again (to add software)"
     echo ""
     echo "Snapshot management:"
     echo "  - View snapshots: zfs list -t snapshot"
