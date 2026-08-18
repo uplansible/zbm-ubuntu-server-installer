@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.48
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.50
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -48,9 +48,12 @@ DATAPOOL_TOPOLOGY=""                   # Set by select_datapool_topology_and_dis
 DATAPOOL_DISK_IDS=()
 DISK_SETUP_MODE=""                     # "single-disk" or "separate-disks"; set during interactive config
 
-# Optional software
-INSTALL_ZELLIJ="y"   # Install Zellij terminal multiplexer (y/n)
-INSTALL_DOCKER="y"   # Install Docker Engine via official apt repo (y/n)
+# Optional software (prompted during postreboot, not initial)
+INSTALL_DOCKER=""    # y/n — Docker Engine via official apt repo; asked in postreboot
+INSTALL_VIRT=""      # y/n — KVM/libvirt headless virtualization; asked in postreboot
+POSTREBOOT_DONE="n"  # flipped to "y" in zbm-installer.conf when postreboot completes
+DOCKER_DATA_ROOT=""  # set by create_software_datasets()
+VIRT_STORAGE_DIR=""  # set by create_software_datasets()
 
 ################################################################################
 # LOCALE SEARCH
@@ -181,8 +184,10 @@ configure_interactively() {
         read -rp "Swap size in GiB (detected RAM: ${ram_gb}GiB, suggested: ${suggested_swap_gib}GiB) [${suggested_swap_gib}]: " input
         if [[ -z "$input" ]]; then
             break
-        elif [[ ! "$input" =~ ^[0-9]+$ ]]; then
-            echo "  Error: swap size must be a non-negative integer (GiB). Try again."
+        elif [[ ! "$input" =~ ^[0-9]+$ ]] || [[ "$input" -lt 1 ]]; then
+            # validate_inputs enforces >=512 MiB later; reject here so the user
+            # can correct it instead of aborting after all remaining prompts
+            echo "  Error: swap size must be a whole number of GiB, at least 1. Try again."
         else
             SWAP_SIZE=$(( input * 1024 ))
             break
@@ -203,10 +208,10 @@ configure_interactively() {
 
     # Keyboard layout: detect from live session, offer to reuse
     echo ""
-    local live_layout live_variant
+    local live_layout="" live_variant=""
     if [[ -f /etc/default/keyboard ]]; then
-        live_layout=$(grep '^XKBLAYOUT=' /etc/default/keyboard | cut -d= -f2 | tr -d '"')
-        live_variant=$(grep '^XKBVARIANT=' /etc/default/keyboard | cut -d= -f2 | tr -d '"')
+        live_layout=$(grep '^XKBLAYOUT=' /etc/default/keyboard | cut -d= -f2 | tr -d '"' || true)
+        live_variant=$(grep '^XKBVARIANT=' /etc/default/keyboard | cut -d= -f2 | tr -d '"' || true)
     fi
     if [[ -n "$live_layout" ]]; then
         local kbd_display="$live_layout"
@@ -272,14 +277,6 @@ configure_interactively() {
         DISK_SETUP_MODE="single-disk"
     fi
 
-    # Software
-    echo ""
-    echo "--- Software ---"
-    read -rp "Install Zellij terminal multiplexer? [Y/n]: " input
-    if [[ "$input" =~ ^[Nn]$ ]]; then INSTALL_ZELLIJ="n"; else INSTALL_ZELLIJ="y"; fi
-    read -rp "Install Docker Engine (official apt repo, not snap)? [Y/n]: " input
-    if [[ "$input" =~ ^[Nn]$ ]]; then INSTALL_DOCKER="n"; else INSTALL_DOCKER="y"; fi
-
     # Summary
     echo ""
     echo "======================================================================"
@@ -296,8 +293,6 @@ configure_interactively() {
     echo "  Keyboard:     $kbd_summary"
     echo "  Datapool:     ${DATAPOOL_NAME:-<none>}"
     echo "  Disk setup:   ${DISK_SETUP_MODE}"
-    echo "  Zellij:       ${INSTALL_ZELLIJ}"
-    echo "  Docker:       ${INSTALL_DOCKER}"
     echo "======================================================================"
     echo ""
 }
@@ -328,8 +323,11 @@ validate_inputs() {
         exit 1
     fi
 
-    # Validate LOCALE format
-    if [[ ! "$LOCALE" =~ ^[a-z]{2}_[A-Z]{2}\.[A-Z0-9-]+$ ]]; then
+    # Validate LOCALE format — accept everything select_locale can offer from
+    # /usr/share/i18n/SUPPORTED: C/POSIX, 2-3 letter languages, optional
+    # country, encoding and @modifier (e.g. C.UTF-8, ca_ES.UTF-8@valencia)
+    if [[ ! "$LOCALE" =~ ^(C|POSIX)(\.[A-Za-z0-9-]+)?$ ]] \
+       && [[ ! "$LOCALE" =~ ^[a-z]{2,3}(_[A-Z]{2})?(\.[A-Za-z0-9-]+)?(@[A-Za-z0-9]+)?$ ]]; then
         echo "Error: Invalid LOCALE '$LOCALE'."
         echo "       Format should be: language_COUNTRY.encoding (e.g., en_US.UTF-8)"
         exit 1
@@ -363,8 +361,10 @@ validate_inputs() {
         fi
     fi
 
-    # Derive datapool mountpoint from pool name
-    if [[ -n "$DATAPOOL_NAME" ]]; then
+    # Derive datapool mountpoint from pool name. Only when it is still unset —
+    # postreboot sources zbm-installer.conf before calling this, and an imported
+    # pool may legitimately have a mountpoint that is not /<poolname>.
+    if [[ -n "$DATAPOOL_NAME" && -z "$DATAPOOL_MOUNTPOINT" ]]; then
         DATAPOOL_MOUNTPOINT="/$DATAPOOL_NAME"
     fi
 
@@ -469,8 +469,10 @@ select_disk() {
     echo "======================================================================"
     if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
         echo "Select the system disk (EFI, Swap, and rpool only — datapool on a separate disk):"
-    else
+    elif [[ -n "$DATAPOOL_NAME" ]]; then
         echo "Select the installation disk (rpool + datapool will share this disk):"
+    else
+        echo "Select the installation disk (EFI, Swap, and rpool):"
     fi
     echo "======================================================================"
 
@@ -535,6 +537,15 @@ select_datapool_topology_and_disks() {
     done < <(lsblk -d -o NAME,SIZE,MODEL --noheadings | grep -v '^loop\|^sr')
 
     local n_extra=${#extra_names[@]}
+
+    # In separate-disks mode every topology (including "single") needs at least
+    # one extra whole disk — without this guard the selection loop below would
+    # prompt "Select disk number [1-0]" forever
+    if [[ "$DISK_SETUP_MODE" == "separate-disks" && $n_extra -lt 1 ]]; then
+        echo ""
+        echo "Warning: no extra disks found for the datapool (install disk $DISK is excluded)."
+        return 1
+    fi
 
     # Build list of valid topologies based on available disk count
     local -a topo_labels topo_values
@@ -660,6 +671,90 @@ select_datapool_topology_and_disks() {
     echo "Selected $DATAPOOL_TOPOLOGY disks: ${selected_devs[*]}"
 }
 
+# Refuse to silently destroy an existing ZFS pool. `zpool create -f` overwrites
+# any label it finds, so every create path must ask first.
+# Usage: confirm_labelclear <device-path>...
+confirm_labelclear() {
+    local dev _clear_it
+    for dev in "$@"; do
+        if zpool import -d "$dev" 2>/dev/null | grep -q "pool:"; then
+            read -rp "  Disk $dev has an existing ZFS label. Clear it? [y/N]: " _clear_it
+            if [[ "$_clear_it" =~ ^[Yy]$ ]]; then
+                zpool labelclear -f "$dev"
+            else
+                echo "Error: Cannot create pool — existing label on $dev. Run: zpool labelclear -f $dev"
+                exit 1
+            fi
+        fi
+    done
+}
+
+# Offer to import an already existing (exported) ZFS pool as the datapool
+# instead of creating a new one. Scans `zpool import` for candidates (rpool
+# excluded).
+# Sets on import: DATAPOOL_NAME, DATAPOOL_MOUNTPOINT (from the imported pool)
+# Returns 0 when a pool was imported; 1 when none exist or the user declined.
+offer_datapool_import() {
+    local -a import_pools=()
+    local name
+    while IFS= read -r name; do
+        [[ "$name" == "rpool" ]] && continue
+        import_pools+=("$name")
+    done < <(zpool import 2>/dev/null | awk '$1 == "pool:" {print $2}')
+
+    (( ${#import_pools[@]} == 0 )) && return 1
+
+    echo ""
+    echo "Importable ZFS pool(s) found:"
+    local i
+    for i in "${!import_pools[@]}"; do
+        printf "  [%d] %s\n" "$((i+1))" "${import_pools[$i]}"
+    done
+    local n_opts=$(( ${#import_pools[@]} + 1 ))
+    printf "  [%d] none — create a new datapool instead\n" "$n_opts"
+    echo ""
+
+    local choice
+    while true; do
+        read -rp "Import an existing pool as the datapool? [1-$n_opts]: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n_opts )); then
+            break
+        fi
+        echo "Invalid selection."
+    done
+    (( choice == n_opts )) && return 1
+
+    local pool="${import_pools[$((choice-1))]}"
+    echo "  - Importing pool '$pool'..."
+    if ! zpool import "$pool" 2>/dev/null; then
+        # Plain import fails when the pool was last used on another system
+        # (hostid mismatch) — that needs -f
+        read -rp "  Plain import failed (pool last used on another system?). Force import? [y/N]: " _force
+        if [[ "$_force" =~ ^[Yy]$ ]]; then
+            if ! zpool import -f "$pool"; then
+                echo "Error: Could not import pool '$pool'."
+                exit 1
+            fi
+        else
+            echo "  Skipping import of '$pool'."
+            return 1
+        fi
+    fi
+
+    DATAPOOL_NAME="$pool"
+    local mp
+    mp=$(zfs get -H -o value mountpoint "$pool")
+    if [[ "$mp" == /* ]]; then
+        DATAPOOL_MOUNTPOINT="$mp"
+    else
+        # Pool root has no usable mountpoint (none/legacy) — give it one
+        DATAPOOL_MOUNTPOINT="/$pool"
+        zfs set mountpoint="$DATAPOOL_MOUNTPOINT" "$pool"
+    fi
+    echo "  ✓ Pool '$pool' imported, mounted at $DATAPOOL_MOUNTPOINT"
+    return 0
+}
+
 # Show a breakdown of available space and prompt for rpool percentage.
 # Reads: DISK, EFI_SIZE, SWAP_SIZE (MiB), RPOOL_PERCENT (default)
 # Sets: RPOOL_SIZE in MiB
@@ -746,6 +841,8 @@ show_disk_confirmation() {
     if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
         printf "  Partition 3 (rpool):    ~%dGiB (all remaining)\n" "$(( RPOOL_SIZE / 1024 ))"
         printf "  Datapool:               separate disk(s) — topology selected at postreboot\n"
+    elif [[ -z "$DATAPOOL_NAME" ]]; then
+        printf "  Partition 3 (rpool):    ~%dGiB (all remaining)\n" "$(( RPOOL_SIZE / 1024 ))"
     else
         local datapool_mib=$(( disk_mib - EFI_SIZE - SWAP_SIZE - RPOOL_SIZE - 2048 ))
         if [[ $datapool_mib -lt 0 ]]; then datapool_mib=0; fi
@@ -860,17 +957,699 @@ select_fastest_mirror() {
 }
 
 ################################################################################
+# USER SHELL ENVIRONMENT (zellij config, bash aliases)
+################################################################################
+# Writes the Zellij config (Alt-based keybinds and plugin commands, mirrored
+# from the admin box) to the given path. Deployed to /etc/skel before user
+# creation so useradd -m copies it with correct ownership.
+# Usage: write_zellij_config <target_file>
+write_zellij_config() {
+    cat > "$1" << 'ZELLIJ_KDL_EOF'
+keybinds clear-defaults=true {
+    locked {
+        bind "Alt g" { SwitchToMode "normal"; }
+    }
+    pane {
+        bind "left" { MoveFocus "left"; }
+        bind "down" { MoveFocus "down"; }
+        bind "up" { MoveFocus "up"; }
+        bind "right" { MoveFocus "right"; }
+        bind "c" { SwitchToMode "renamepane"; PaneNameInput 0; }
+        bind "d" { NewPane "down"; SwitchToMode "normal"; }
+        bind "e" { TogglePaneEmbedOrFloating; SwitchToMode "normal"; }
+        bind "f" { ToggleFocusFullscreen; SwitchToMode "normal"; }
+        bind "h" { MoveFocus "left"; }
+        bind "i" { TogglePanePinned; SwitchToMode "normal"; }
+        bind "j" { MoveFocus "down"; }
+        bind "k" { MoveFocus "up"; }
+        bind "l" { MoveFocus "right"; }
+        bind "n" { NewPane; SwitchToMode "normal"; }
+        bind "p" { SwitchFocus; }
+        bind "Alt p" { SwitchToMode "normal"; }
+        bind "r" { NewPane "right"; SwitchToMode "normal"; }
+        bind "s" { NewPane "stacked"; SwitchToMode "normal"; }
+        bind "w" { ToggleFloatingPanes; SwitchToMode "normal"; }
+        bind "z" { TogglePaneFrames; SwitchToMode "normal"; }
+    }
+    tab {
+        bind "left" { GoToPreviousTab; }
+        bind "down" { GoToNextTab; }
+        bind "up" { GoToPreviousTab; }
+        bind "right" { GoToNextTab; }
+        bind "1" { GoToTab 1; SwitchToMode "normal"; }
+        bind "2" { GoToTab 2; SwitchToMode "normal"; }
+        bind "3" { GoToTab 3; SwitchToMode "normal"; }
+        bind "4" { GoToTab 4; SwitchToMode "normal"; }
+        bind "5" { GoToTab 5; SwitchToMode "normal"; }
+        bind "6" { GoToTab 6; SwitchToMode "normal"; }
+        bind "7" { GoToTab 7; SwitchToMode "normal"; }
+        bind "8" { GoToTab 8; SwitchToMode "normal"; }
+        bind "9" { GoToTab 9; SwitchToMode "normal"; }
+        bind "[" { BreakPaneLeft; SwitchToMode "normal"; }
+        bind "]" { BreakPaneRight; SwitchToMode "normal"; }
+        bind "b" { BreakPane; SwitchToMode "normal"; }
+        bind "h" { GoToPreviousTab; }
+        bind "j" { GoToNextTab; }
+        bind "k" { GoToPreviousTab; }
+        bind "l" { GoToNextTab; }
+        bind "n" { NewTab; SwitchToMode "normal"; }
+        bind "r" { SwitchToMode "renametab"; TabNameInput 0; }
+        bind "s" { ToggleActiveSyncTab; SwitchToMode "normal"; }
+        bind "Alt t" { SwitchToMode "normal"; }
+        bind "x" { CloseTab; SwitchToMode "normal"; }
+        bind "tab" { ToggleTab; }
+    }
+    resize {
+        bind "left" { Resize "Increase left"; }
+        bind "down" { Resize "Increase down"; }
+        bind "up" { Resize "Increase up"; }
+        bind "right" { Resize "Increase right"; }
+        bind "+" { Resize "Increase"; }
+        bind "-" { Resize "Decrease"; }
+        bind "=" { Resize "Increase"; }
+        bind "H" { Resize "Decrease left"; }
+        bind "J" { Resize "Decrease down"; }
+        bind "K" { Resize "Decrease up"; }
+        bind "L" { Resize "Decrease right"; }
+        bind "h" { Resize "Increase left"; }
+        bind "j" { Resize "Increase down"; }
+        bind "k" { Resize "Increase up"; }
+        bind "l" { Resize "Increase right"; }
+        bind "Alt n" { SwitchToMode "normal"; }
+    }
+    move {
+        bind "left" { MovePane "left"; }
+        bind "down" { MovePane "down"; }
+        bind "up" { MovePane "up"; }
+        bind "right" { MovePane "right"; }
+        bind "h" { MovePane "left"; }
+        bind "Alt h" { SwitchToMode "normal"; }
+        bind "j" { MovePane "down"; }
+        bind "k" { MovePane "up"; }
+        bind "l" { MovePane "right"; }
+        bind "n" { MovePane; }
+        bind "p" { MovePaneBackwards; }
+        bind "tab" { MovePane; }
+    }
+    scroll {
+        bind "e" { EditScrollback; SwitchToMode "normal"; }
+        bind "s" { SwitchToMode "entersearch"; SearchInput 0; }
+        bind "Alt s" { SwitchToMode "normal"; }
+    }
+    search {
+        bind "c" { SearchToggleOption "CaseSensitivity"; }
+        bind "n" { Search "down"; }
+        bind "o" { SearchToggleOption "WholeWord"; }
+        bind "p" { Search "up"; }
+        bind "w" { SearchToggleOption "Wrap"; }
+    }
+    session {
+        bind "a" {
+            LaunchOrFocusPlugin "zellij:about" {
+                floating true
+                move_to_focused_tab true
+            }
+            SwitchToMode "normal"
+        }
+        bind "c" {
+            LaunchOrFocusPlugin "configuration" {
+                floating true
+                move_to_focused_tab true
+            }
+            SwitchToMode "normal"
+        }
+        bind "Alt o" { SwitchToMode "normal"; }
+        bind "p" {
+            LaunchOrFocusPlugin "plugin-manager" {
+                floating true
+                move_to_focused_tab true
+            }
+            SwitchToMode "normal"
+        }
+        bind "s" {
+            LaunchOrFocusPlugin "zellij:share" {
+                floating true
+                move_to_focused_tab true
+            }
+            SwitchToMode "normal"
+        }
+        bind "w" {
+            LaunchOrFocusPlugin "session-manager" {
+                floating true
+                move_to_focused_tab true
+            }
+            SwitchToMode "normal"
+        }
+    }
+    shared {
+        bind "Alt left" { MoveFocusOrTab "left"; }
+        bind "Alt down" { MoveFocus "down"; }
+        bind "Alt up" { MoveFocus "up"; }
+        bind "Alt right" { MoveFocusOrTab "right"; }
+        bind "Alt +" { Resize "Increase"; }
+        bind "Alt -" { Resize "Decrease"; }
+        bind "Alt =" { Resize "Increase"; }
+        bind "Alt [" { PreviousSwapLayout; }
+        bind "Alt ]" { NextSwapLayout; }
+        bind "Alt f" { ToggleFloatingPanes; }
+        bind "Alt i" { MoveTab "left"; }
+        bind "Alt j" { MoveFocus "down"; }
+        bind "Alt k" { MoveFocus "up"; }
+        bind "Alt l" { MoveFocusOrTab "right"; }
+    }
+    shared_except "locked" {
+        bind "Alt Shift p" { ToggleGroupMarking; }
+    }
+    shared_except "locked" "entersearch" "renametab" "renamepane" "move" "prompt" "tmux" {
+        bind "Alt h" { SwitchToMode "move"; }
+    }
+    shared_except "locked" "entersearch" "renametab" "renamepane" "prompt" "tmux" {
+        bind "Alt g" { SwitchToMode "locked"; }
+        bind "Alt q" { Quit; }
+    }
+    shared_except "locked" "entersearch" "renametab" "renamepane" "session" "prompt" "tmux" {
+        bind "Alt o" { SwitchToMode "session"; }
+    }
+    shared_except "locked" "scroll" "search" "tmux" {
+        bind "Ctrl b" { SwitchToMode "tmux"; }
+    }
+    shared_except "locked" "scroll" "entersearch" "renametab" "renamepane" "prompt" "tmux" {
+        bind "Alt s" { SwitchToMode "scroll"; }
+    }
+    shared_except "locked" "tab" "entersearch" "renametab" "renamepane" "prompt" "tmux" {
+        bind "Alt t" { SwitchToMode "tab"; }
+    }
+    shared_except "locked" "pane" "entersearch" "renametab" "renamepane" "prompt" "tmux" {
+        bind "Alt p" { SwitchToMode "pane"; }
+    }
+    shared_except "locked" "resize" "entersearch" "renametab" "renamepane" "prompt" "tmux" {
+        bind "Alt n" { SwitchToMode "resize"; }
+    }
+    shared_among "locked" "entersearch" "renametab" "renamepane" "prompt" "tmux" {
+        bind "Alt h" { MoveFocusOrTab "left"; }
+        bind "Alt n" { NewPane; }
+        bind "Alt o" { MoveTab "right"; }
+    }
+    shared_except "normal" "locked" "entersearch" {
+        bind "enter" { SwitchToMode "normal"; }
+    }
+    shared_except "normal" "locked" "entersearch" "renametab" "renamepane" {
+        bind "esc" { SwitchToMode "normal"; }
+    }
+    shared_among "pane" "tmux" {
+        bind "x" { CloseFocus; SwitchToMode "normal"; }
+    }
+    shared_among "scroll" "search" {
+        bind "PageDown" { PageScrollDown; }
+        bind "PageUp" { PageScrollUp; }
+        bind "left" { PageScrollUp; }
+        bind "down" { ScrollDown; }
+        bind "up" { ScrollUp; }
+        bind "right" { PageScrollDown; }
+        bind "Ctrl b" { PageScrollUp; }
+        bind "Ctrl c" { ScrollToBottom; SwitchToMode "normal"; }
+        bind "d" { HalfPageScrollDown; }
+        bind "Ctrl f" { PageScrollDown; }
+        bind "h" { PageScrollUp; }
+        bind "j" { ScrollDown; }
+        bind "k" { ScrollUp; }
+        bind "l" { PageScrollDown; }
+        bind "u" { HalfPageScrollUp; }
+    }
+    entersearch {
+        bind "Ctrl c" { SwitchToMode "scroll"; }
+        bind "esc" { SwitchToMode "scroll"; }
+        bind "enter" { SwitchToMode "search"; }
+    }
+    shared_among "entersearch" "renametab" "renamepane" "prompt" "tmux" {
+        bind "Ctrl g" { SwitchToMode "locked"; }
+        bind "Ctrl h" { SwitchToMode "move"; }
+        bind "Ctrl n" { SwitchToMode "resize"; }
+        bind "Ctrl o" { SwitchToMode "session"; }
+        bind "Ctrl p" { SwitchToMode "pane"; }
+        bind "Alt p" { TogglePaneInGroup; }
+        bind "Ctrl q" { Quit; }
+        bind "Ctrl s" { SwitchToMode "scroll"; }
+        bind "Ctrl t" { SwitchToMode "tab"; }
+    }
+    renametab {
+        bind "esc" { UndoRenameTab; SwitchToMode "tab"; }
+    }
+    shared_among "renametab" "renamepane" {
+        bind "Ctrl c" { SwitchToMode "normal"; }
+    }
+    renamepane {
+        bind "esc" { UndoRenamePane; SwitchToMode "pane"; }
+    }
+    shared_among "session" "tmux" {
+        bind "d" { Detach; }
+    }
+    tmux {
+        bind "left" { MoveFocus "left"; SwitchToMode "normal"; }
+        bind "down" { MoveFocus "down"; SwitchToMode "normal"; }
+        bind "up" { MoveFocus "up"; SwitchToMode "normal"; }
+        bind "right" { MoveFocus "right"; SwitchToMode "normal"; }
+        bind "space" { NextSwapLayout; }
+        bind "\"" { NewPane "down"; SwitchToMode "normal"; }
+        bind "%" { NewPane "right"; SwitchToMode "normal"; }
+        bind "," { SwitchToMode "renametab"; }
+        bind "[" { SwitchToMode "scroll"; }
+        bind "Ctrl b" { Write 2; SwitchToMode "normal"; }
+        bind "c" { NewTab; SwitchToMode "normal"; }
+        bind "h" { MoveFocus "left"; SwitchToMode "normal"; }
+        bind "j" { MoveFocus "down"; SwitchToMode "normal"; }
+        bind "k" { MoveFocus "up"; SwitchToMode "normal"; }
+        bind "l" { MoveFocus "right"; SwitchToMode "normal"; }
+        bind "n" { GoToNextTab; SwitchToMode "normal"; }
+        bind "o" { FocusNextPane; }
+        bind "p" { GoToPreviousTab; SwitchToMode "normal"; }
+        bind "z" { ToggleFocusFullscreen; SwitchToMode "normal"; }
+    }
+}
+
+// Plugin aliases - can be used to change the implementation of Zellij
+// changing these requires a restart to take effect
+plugins {
+    about location="zellij:about"
+    compact-bar location="zellij:compact-bar"
+    configuration location="zellij:configuration"
+    filepicker location="zellij:strider" {
+        cwd "/"
+    }
+    plugin-manager location="zellij:plugin-manager"
+    session-manager location="zellij:session-manager"
+    status-bar location="zellij:status-bar"
+    strider location="zellij:strider"
+    tab-bar location="zellij:tab-bar"
+    welcome-screen location="zellij:session-manager" {
+        welcome_screen true
+    }
+}
+
+// Plugins to load in the background when a new session starts
+// eg. "file:/path/to/my-plugin.wasm"
+// eg. "https://example.com/my-plugin.wasm"
+load_plugins {
+}
+web_client {
+    font "monospace"
+}
+
+// Whether to show tips on startup
+show_startup_tips false
+ZELLIJ_KDL_EOF
+}
+
+# Writes ~/.bash_aliases (sourced near the end of the stock Ubuntu ~/.bashrc,
+# so it can override the history defaults set earlier in that file).
+# Usage: write_bash_aliases <target_file>
+write_bash_aliases() {
+    cat > "$1" << 'ALIASES_EOF'
+# uhoh — rerun the previous command with sudo (like `sudo !!`)
+uhoh() {
+    local last
+    last=$(fc -ln -1)
+    last="${last#"${last%%[![:space:]]*}"}"   # trim leading whitespace
+    if [[ -z "$last" ]]; then
+        echo "uhoh: no previous command" >&2
+        return 1
+    fi
+    echo "uhoh: sudo $last" >&2
+    # bash -c keeps pipes/redirections inside the sudo context
+    sudo bash -c "$last"
+}
+
+# History: large, deduplicated, shared across zellij panes
+# (overrides the stock .bashrc values; histappend is already set there)
+HISTSIZE=100000
+HISTFILESIZE=200000
+HISTCONTROL=ignoreboth:erasedups
+PROMPT_COMMAND="history -a${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+
+# Terminal CWD reporting for Tabby SFTP panel sync.
+# Inside Zellij over SSH: emit custom OSC 7727 directly to the outer SSH PTY
+# (Zellij intercepts OSC 7 internally but passes unknown OSC numbers through;
+# the tabby-zellij-sudo plugin reads OSC 7727 and moves the SFTP panel).
+# Outside Zellij: emit standard OSC 7 which Tabby handles natively.
+_report_cwd() {
+    local encoded="" i char hex
+    for (( i=0; i<${#PWD}; i++ )); do
+        char="${PWD:$i:1}"
+        case "$char" in
+            [a-zA-Z0-9/._~:-]) encoded+="$char" ;;
+            *) printf -v hex '%%%02X' "'$char"; encoded+="$hex" ;;
+        esac
+    done
+    if [ -n "${ZELLIJ:-}" ] && [ -w "${SSH_TTY:-}" ]; then
+        printf '\033]7727;CWD=%s\007' "$encoded" > "$SSH_TTY"
+    else
+        printf '\033]7;file://%s%s\007' "${HOSTNAME}" "${encoded}"
+    fi
+}
+PROMPT_COMMAND="_report_cwd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+ALIASES_EOF
+}
+################################################################################
+# MODE AUTO-DETECTION
+################################################################################
+# Detects which phase to run when no mode argument is given:
+#   live USB (casper/overlay root)         → initial
+#   installed system, postreboot pending   → postreboot
+#   installed system, postreboot done      → reinstall-zbm (after confirmation)
+# Sets the global MODE variable or exits with usage on failure.
+detect_mode() {
+    local root_fstype conf _ans
+    root_fstype=$(findmnt -n -o FSTYPE / 2>/dev/null || echo "")
+    # Conf lives next to the script (same convention as the postreboot loader)
+    conf="$(dirname "$0")/zbm-installer.conf"
+
+    if [[ "$root_fstype" == "zfs" ]]; then
+        if [[ -f "$conf" ]] && grep -q '^POSTREBOOT_DONE="y"' "$conf"; then
+            echo "Detected: installed system, post-reboot setup already completed."
+            read -rp "Reinstall/update ZFSBootMenu now? [y/N]: " _ans
+            if [[ ! "$_ans" =~ ^[Yy]$ ]]; then
+                echo "Nothing to do."
+                exit 0
+            fi
+            MODE="reinstall-zbm"
+        else
+            echo "Detected: installed system, post-reboot setup pending."
+            MODE="postreboot"
+        fi
+    elif grep -qw 'boot=casper' /proc/cmdline 2>/dev/null \
+         || [[ -d /run/casper ]] || [[ "$root_fstype" == "overlay" ]]; then
+        echo "Detected: live USB environment."
+        MODE="initial"
+    else
+        echo "Error: could not detect environment (root fstype: ${root_fstype:-unknown})."
+        echo ""
+        echo "Usage: $0 [initial|postreboot|reinstall-zbm]"
+        echo ""
+        echo "  initial       - Run from live USB to install system"
+        echo "  postreboot    - Run after first boot to complete setup"
+        echo "  reinstall-zbm - Reinstall or update ZFSBootMenu to latest version"
+        exit 1
+    fi
+}
+
+################################################################################
+# POSTREBOOT SOFTWARE SELECTION & INSTALLATION
+################################################################################
+# Interactive software selection for postreboot. Sets INSTALL_DOCKER, INSTALL_VIRT.
+prompt_postreboot_software() {
+    local input
+    echo ""
+    echo "--- Optional software ---"
+    read -rp "Install Docker Engine (official apt repo, not snap)? [Y/n]: " input
+    if [[ "$input" =~ ^[Nn]$ ]]; then INSTALL_DOCKER="n"; else INSTALL_DOCKER="y"; fi
+    read -rp "Install KVM/libvirt headless virtualization (qemu, libvirt, virtinst)? [y/N]: " input
+    if [[ "$input" =~ ^[Yy]$ ]]; then INSTALL_VIRT="y"; else INSTALL_VIRT="n"; fi
+}
+
+# Picks the pool that receives the software datasets (docker/virtmanager).
+# Candidates are all imported pools except rpool whose root dataset has a real
+# mountpoint (needed because the datasets inherit it). One candidate → used
+# automatically; several → interactive menu with rpool as explicit fallback;
+# none → rpool.
+# Sets globals: STORAGE_POOL, STORAGE_BASE
+select_storage_pool() {
+    local -a pools=() bases=()
+    local p mp
+    while IFS= read -r p; do
+        [[ "$p" == "rpool" ]] && continue
+        mp=$(zfs get -H -o value mountpoint "$p")
+        if [[ "$mp" == /* ]]; then
+            pools+=("$p")
+            bases+=("$mp")
+        else
+            echo "  (pool '$p' has mountpoint '$mp' — not offered for software datasets)"
+        fi
+    done < <(zpool list -H -o name)
+
+    if (( ${#pools[@]} == 0 )); then
+        STORAGE_POOL="rpool"
+        STORAGE_BASE=""
+    elif (( ${#pools[@]} == 1 )); then
+        STORAGE_POOL="${pools[0]}"
+        STORAGE_BASE="${bases[0]}"
+    else
+        local i choice n_opts=$(( ${#pools[@]} + 1 ))
+        echo ""
+        echo "Several pools can hold the software datasets (docker/virtmanager):"
+        for i in "${!pools[@]}"; do
+            printf "  %d) %-16s (mounted at %s)\n" "$((i+1))" "${pools[$i]}" "${bases[$i]}"
+        done
+        printf "  %d) %-16s (system pool; datasets mount at /docker, /virtmanager)\n" "$n_opts" "rpool"
+        while true; do
+            read -rp "Select pool [1-$n_opts]: " choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n_opts )); then
+                break
+            fi
+            echo "  Invalid selection."
+        done
+        if (( choice == n_opts )); then
+            STORAGE_POOL="rpool"
+            STORAGE_BASE=""
+        else
+            STORAGE_POOL="${pools[$((choice-1))]}"
+            STORAGE_BASE="${bases[$((choice-1))]}"
+        fi
+    fi
+}
+
+# Creates ZFS datasets for the selected software on the given pool (idempotent).
+# Usage: create_software_datasets <pool> <mount_base>
+#   datapool: <pool>=$DATAPOOL_NAME, <mount_base>=$DATAPOOL_MOUNTPOINT
+#             (pool has a real mountpoint → children inherit it)
+#   rpool:    <pool>=rpool, <mount_base>=""
+#             (rpool root is mountpoint=none → parents get explicit mountpoints)
+# Sets globals: DOCKER_DATA_ROOT, VIRT_STORAGE_DIR
+create_software_datasets() {
+    local pool="$1" base="$2"
+    local -a mp_docker=() mp_virt=()
+    if [[ "$pool" == "rpool" ]]; then
+        mp_docker=(-o mountpoint=/docker)
+        mp_virt=(-o mountpoint=/virtmanager)
+    fi
+
+    if [[ "$INSTALL_DOCKER" == "y" ]]; then
+        echo "  - Creating Docker datasets under $pool/docker..."
+
+        # Parent dataset — inherits pool compression/atime
+        zfs list "$pool/docker" &>/dev/null || \
+            zfs create ${mp_docker[@]+"${mp_docker[@]}"} "$pool/docker"
+
+        # dockerroot: Docker's data-root (overlay2 layers, images, containers)
+        #   recordsize=16K   — overlay2 writes in small blocks
+        #   xattr=sa         — required for overlay2
+        #   acltype=posixacl — required for overlay2
+        zfs list "$pool/docker/dockerroot" &>/dev/null || \
+            zfs create \
+                -o recordsize=16K \
+                -o xattr=sa \
+                -o acltype=posixacl \
+                "$pool/docker/dockerroot"
+
+        # storage: external volume data mounted into containers
+        #   default recordsize (128K) suits mixed file sizes
+        zfs list "$pool/docker/storage" &>/dev/null || \
+            zfs create "$pool/docker/storage"
+
+        # stack: docker-compose files (small text files)
+        #   recordsize=4K — minimises wasted space for tiny config files
+        zfs list "$pool/docker/stack" &>/dev/null || \
+            zfs create \
+                -o recordsize=4K \
+                "$pool/docker/stack"
+
+        DOCKER_DATA_ROOT="$base/docker/dockerroot"
+        echo "  ✓ Docker datasets created"
+    fi
+
+    if [[ "$INSTALL_VIRT" == "y" ]]; then
+        echo "  - Creating virtualization datasets under $pool/virtmanager..."
+
+        zfs list "$pool/virtmanager" &>/dev/null || \
+            zfs create ${mp_virt[@]+"${mp_virt[@]}"} "$pool/virtmanager"
+
+        # storage: VM disk images
+        #   recordsize=64K — matches qcow2 default cluster size
+        zfs list "$pool/virtmanager/storage" &>/dev/null || \
+            zfs create \
+                -o recordsize=64K \
+                "$pool/virtmanager/storage"
+
+        VIRT_STORAGE_DIR="$base/virtmanager/storage"
+        echo "  ✓ Virtualization datasets created"
+    fi
+}
+
+# Reports the data-root dockerd is currently configured for, or "" when
+# /etc/docker/daemon.json has no data-root key (dockerd default: /var/lib/docker).
+current_docker_data_root() {
+    [[ -f /etc/docker/daemon.json ]] || return 0
+    sed -n 's/.*"data-root"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        /etc/docker/daemon.json | head -1
+}
+
+# Repoints an already-installed Docker at DOCKER_DATA_ROOT. Existing image and
+# container data is never moved automatically — that is the user's call — so a
+# non-empty current data-root is reported and confirmed first.
+repoint_existing_docker() {
+    local current effective
+    current=$(current_docker_data_root)
+    effective="${current:-/var/lib/docker}"
+
+    if [[ "$effective" == "$DOCKER_DATA_ROOT" ]]; then
+        echo "  ✓ Docker already using data-root $DOCKER_DATA_ROOT"
+        return 0
+    fi
+
+    echo "  - Docker is installed with data-root: $effective"
+    echo "    The datasets created above expect:   $DOCKER_DATA_ROOT"
+
+    # Anything beyond an empty dir means images/containers/volumes would become
+    # invisible after the switch
+    local has_data="no"
+    if [[ -d "$effective" ]] && [[ -n "$(ls -A "$effective" 2>/dev/null)" ]]; then
+        has_data="yes"
+        echo "    ⚠ $effective is NOT empty — existing images, containers and"
+        echo "      volumes will become invisible until you migrate them, e.g.:"
+        echo "        systemctl stop docker && rsync -aHAX $effective/ $DOCKER_DATA_ROOT/"
+    fi
+
+    local _ans
+    if [[ "$has_data" == "yes" ]]; then
+        read -rp "  Repoint Docker to $DOCKER_DATA_ROOT anyway? [y/N]: " _ans
+    else
+        read -rp "  Repoint Docker to $DOCKER_DATA_ROOT? [Y/n]: " _ans
+        [[ -z "$_ans" ]] && _ans="y"
+    fi
+    if [[ ! "$_ans" =~ ^[Yy]$ ]]; then
+        echo "  ✓ Leaving Docker data-root at $effective"
+        return 0
+    fi
+
+    systemctl stop docker 2>/dev/null || true
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json << DOCKEREOF
+{
+    "data-root": "$DOCKER_DATA_ROOT",
+    "storage-driver": "overlay2"
+}
+DOCKEREOF
+    systemctl start docker
+    echo "  ✓ Docker data-root set to $DOCKER_DATA_ROOT"
+}
+
+# Installs Docker Engine on the running system. daemon.json (data-root) is
+# written BEFORE installation so dockerd never populates /var/lib/docker.
+# Requires: DOCKER_DATA_ROOT set by create_software_datasets().
+install_docker_postreboot() {
+    if command -v docker &>/dev/null; then
+        echo "  ✓ Docker already installed — checking data-root"
+        repoint_existing_docker
+        # Keep group membership idempotent for re-runs
+        usermod -aG docker "$USERNAME"
+        return 0
+    fi
+
+    # 1. daemon.json first — the package postinst starts dockerd, which must
+    #    already see the ZFS-backed data-root
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json << DOCKEREOF
+{
+    "data-root": "$DOCKER_DATA_ROOT",
+    "storage-driver": "overlay2"
+}
+DOCKEREOF
+
+    # 2. Docker's official apt repo
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    local codename arch
+    codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+    arch=$(dpkg --print-architecture)
+    cat > /etc/apt/sources.list.d/docker.sources << SRCEOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $codename
+Components: stable
+Architectures: $arch
+Signed-By: /etc/apt/keyrings/docker.asc
+SRCEOF
+
+    # 3. Install — postinst starts dockerd with the daemon.json above
+    apt update
+    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    # 4. Group membership (takes effect on next login)
+    usermod -aG docker "$USERNAME"
+    echo "  ✓ Docker $(docker --version) installed, data-root: $DOCKER_DATA_ROOT"
+    echo "  ✓ User $USERNAME added to 'docker' group"
+}
+
+# Installs headless KVM/libvirt and points the libvirt "default" storage pool
+# at the ZFS-backed VIRT_STORAGE_DIR. No GUI (virt-manager connects remotely).
+# Requires: VIRT_STORAGE_DIR set by create_software_datasets().
+install_virtualization_postreboot() {
+    # dnsmasq-base is only a Recommends of libvirt-daemon-system — with
+    # --no-install-recommends it must be listed explicitly or the "default"
+    # NAT network cannot start (VMs would have no networking)
+    # Package lists may be stale when Docker was not selected (which is what
+    # otherwise runs apt update on this boot)
+    apt update
+    apt install -y --no-install-recommends \
+        qemu-system-x86 \
+        libvirt-daemon-system \
+        libvirt-clients \
+        virtinst \
+        ovmf \
+        dnsmasq-base
+
+    # Recent libvirt splits the monolithic libvirtd into modular daemons, so
+    # libvirtd.service is not guaranteed to exist. Enable whichever is present
+    # and let the socket-activated units cover the rest.
+    if systemctl list-unit-files libvirtd.service &>/dev/null \
+       && systemctl enable --now libvirtd 2>/dev/null; then
+        echo "  ✓ libvirtd enabled"
+    else
+        systemctl enable --now virtqemud.socket virtnetworkd.socket virtstoraged.socket 2>/dev/null || true
+        echo "  ✓ modular libvirt daemons enabled"
+    fi
+    usermod -aG libvirt "$USERNAME"
+
+    # Bring up the default NAT network now and on every boot.
+    # Non-fatal: a missing/renamed default network must not abort postreboot
+    # after Docker and the datapool are already in place.
+    virsh net-autostart default 2>/dev/null || echo "  ⚠ could not autostart libvirt 'default' network"
+    virsh net-start default 2>/dev/null || true  # fails harmlessly if already active
+
+    # Define the default storage pool on ZFS (idempotent)
+    if ! virsh pool-info default &>/dev/null; then
+        if virsh pool-define-as default dir --target "$VIRT_STORAGE_DIR"; then
+            virsh pool-build default 2>/dev/null || true  # dir already exists (dataset mountpoint)
+            virsh pool-start default    2>/dev/null || true
+            virsh pool-autostart default 2>/dev/null || true
+            echo "  ✓ libvirt 'default' storage pool → $VIRT_STORAGE_DIR"
+        else
+            echo "  ⚠ Could not define the libvirt 'default' pool; create it manually:"
+            echo "      virsh pool-define-as default dir --target $VIRT_STORAGE_DIR"
+        fi
+    else
+        echo "  ✓ libvirt 'default' pool already defined, skipping"
+    fi
+    echo "  ✓ KVM/libvirt installed (user $USERNAME in 'libvirt' group; re-login required)"
+}
+
+################################################################################
 # INSTALLATION MODE
 ################################################################################
 MODE="${1:-}"
 
 if [[ -z "$MODE" ]]; then
-    echo "Usage: $0 {initial|postreboot|reinstall-zbm}"
-    echo ""
-    echo "  initial       - Run from live USB to install system"
-    echo "  postreboot    - Run after first boot to complete setup"
-    echo "  reinstall-zbm - Reinstall or update ZFSBootMenu to latest version"
-    exit 1
+    detect_mode
 fi
 
 ################################################################################
@@ -943,7 +1722,6 @@ if [[ "$MODE" == "initial" ]]; then
             echo "This script requires internet access for:"
             echo "  - Package downloads (apt, debootstrap)"
             echo "  - ZFSBootMenu git repository"
-            echo "  - Zellij binary download"
             echo "Please check your network connection and try again."
             exit 1
         fi
@@ -980,8 +1758,11 @@ if [[ "$MODE" == "initial" ]]; then
     echo "Validating disk size..."
     validate_disk_size "$DISK"
 
-    # Interactively select rpool percentage and compute RPOOL_SIZE
-    if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
+    # Interactively select rpool percentage and compute RPOOL_SIZE.
+    # The percentage split only makes sense when a datapool shares this disk;
+    # otherwise rpool takes everything (a percentage would leave the rest
+    # unpartitioned and permanently unusable).
+    if [[ "$DISK_SETUP_MODE" == "separate-disks" || -z "$DATAPOOL_NAME" ]]; then
         # rpool gets the full remaining disk — no percentage question
         _disk_bytes=$(blockdev --getsize64 "$DISK")
         _disk_mib=$(( _disk_bytes / 1024 / 1024 ))
@@ -1047,7 +1828,10 @@ if [[ "$MODE" == "initial" ]]; then
     echo "No mounted partitions found."
 
     echo "Checking for existing ZFS labels on $DISK..."
-    if zpool import 2>/dev/null | grep -q "$(basename "$DISK")"; then
+    # Match the disk name and its partitions (sda -> sda3, nvme0n1 -> nvme0n1p1)
+    # but not a different disk that merely starts the same way (sda vs sdaa)
+    if zpool import 2>/dev/null \
+        | grep -qE "(^|[^[:alnum:]])$(basename "$DISK")(p?[0-9]+)?([^[:alnum:]]|\$)"; then
         echo "Warning: Disk $DISK appears to be part of an importable ZFS pool!"
         echo "Proceeding will destroy that pool's data."
         echo "Press Ctrl+C within 10 seconds to abort, or wait to continue..."
@@ -1057,13 +1841,13 @@ if [[ "$MODE" == "initial" ]]; then
     sgdisk --zap-all "$DISK"
     sgdisk -n1:0:+${EFI_SIZE}M -t1:EF00 "$DISK"     # EFI  (MiB)
     sgdisk -n2:0:+${SWAP_SIZE}M -t2:8200 "$DISK"    # Swap (MiB)
-    if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
+    # rpool takes the whole rest of the disk unless a datapool partition has to
+    # be carved out of the same disk (single-disk mode with a datapool)
+    if [[ "$DISK_SETUP_MODE" == "separate-disks" || -z "$DATAPOOL_NAME" ]]; then
         sgdisk -n3:0:0 -t3:BF00 "$DISK"             # rpool (all remaining space)
     else
         sgdisk -n3:0:+${RPOOL_SIZE}M -t3:BF00 "$DISK"   # rpool (MiB)
-        if [[ -n "$DATAPOOL_NAME" ]]; then
-            sgdisk -n4:0:0 -t4:BF00 "$DISK"         # datapool (ZFS partition)
-        fi
+        sgdisk -n4:0:0 -t4:BF00 "$DISK"             # datapool (ZFS partition)
     fi
 
     # Wait for kernel to update partition table
@@ -1099,7 +1883,9 @@ if [[ "$MODE" == "initial" ]]; then
             echo "  Waiting for $part to appear (attempt $((retry + 1))/$MAX_RETRIES)..."
             sleep $RETRY_DELAY
             udevadm settle
-            ((retry++))
+            # NOT ((retry++)) — that returns exit status 1 when retry is 0,
+            # which set -e turns into a fatal error on the very first retry
+            retry=$(( retry + 1 ))
         done
 
         if [[ ! -b "$part" ]]; then
@@ -1257,11 +2043,29 @@ ff02::1 ip6-allnodes
 ff02::2 ip6-allrouters
 EOF
 
-    # Configure apt sources (using selected mirror; security always via official archive)
-    cat > /mnt/etc/apt/sources.list << EOF
-deb $APT_MIRROR resolute main restricted universe multiverse
-deb $APT_MIRROR resolute-updates main restricted universe multiverse
-deb https://security.ubuntu.com/ubuntu resolute-security main restricted universe multiverse
+    # Configure apt sources (using selected mirror; security always via official
+    # archive). Ubuntu 24.04+ uses deb822 in /etc/apt/sources.list.d/ubuntu.sources.
+    # Neither file is owned by a package, so both are ours to write.
+    mkdir -p /mnt/etc/apt/sources.list.d
+    cat > /mnt/etc/apt/sources.list.d/ubuntu.sources << EOF
+Types: deb
+URIs: $APT_MIRROR
+Suites: resolute resolute-updates
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: https://security.ubuntu.com/ubuntu
+Suites: resolute-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+
+    # debootstrap may also have written the legacy one-line file; leaving both
+    # in place makes apt report every suite as "configured multiple times"
+    cat > /mnt/etc/apt/sources.list << 'EOF'
+# Ubuntu sources are configured in /etc/apt/sources.list.d/ubuntu.sources
+# (deb822 format). Do not add entries here — they would duplicate that file.
 EOF
 
     # Configure basic network (DHCP on all interfaces)
@@ -1376,15 +2180,11 @@ WantedBy=timers.target
 EOF
 
     # Create chroot script with proper variable expansion
-    # NOTE: Using unquoted EOF allows variable expansion for $LOCALE, $INSTALL_DOCKER,
-    # $INSTALL_ZELLIJ, $USERNAME. Use \$ for variables that must be evaluated inside chroot.
+    # NOTE: Using unquoted EOF allows variable expansion for $LOCALE, $KEYBOARD_LAYOUT,
+    # $KEYBOARD_VARIANT. Use \$ for variables that must be evaluated inside chroot.
     cat > /mnt/tmp/chroot-install.sh << EOF
 #!/bin/bash
 set -euo pipefail
-
-# Set locale
-locale-gen "$LOCALE"
-update-locale LANG="$LOCALE"
 
 # Configure keyboard layout (reconfigure deferred until after packages are installed)
 cat > /etc/default/keyboard << 'KBEOF'
@@ -1394,12 +2194,18 @@ XKBOPTIONS=""
 BACKSPACE="guess"
 KBEOF
 
-# Make transient apt errors fatal so stale package lists don't cause silent failures
+# Make transient apt errors fatal so stale package lists don't cause silent
+# failures. Install-time scaffolding only — removed at the end of this script so
+# the installed system is not left with a hair-trigger `apt update`.
 echo 'APT::Update::Error-Mode "any";' > /etc/apt/apt.conf.d/30apt_error_on_transient
 
-# Bootstrap: install ca-certificates and curl first so HTTPS mirrors work
-# and curl is available for Docker/Zellij installs later in this script
-apt install -y --no-install-recommends ca-certificates curl
+# Bootstrap: install ca-certificates and curl first so HTTPS mirrors work.
+# Normally the debootstrap-populated lists suffice; fall back to a plain
+# apt update (against the pre-bootstrap sources) if they don't.
+apt install -y --no-install-recommends ca-certificates curl || {
+    apt update
+    apt install -y --no-install-recommends ca-certificates curl
+}
 
 # Update package lists and upgrade base system using the selected mirror
 apt update
@@ -1432,6 +2238,10 @@ apt install -y --no-install-recommends \
 
 # keyboard-configuration and console-setup are now installed; apply the layout
 dpkg-reconfigure -f noninteractive keyboard-configuration
+
+# Set locale (locale-gen/update-locale ship in the locales package installed above)
+locale-gen "$LOCALE"
+update-locale LANG="$LOCALE"
 # Apply console keyboard layout (may not succeed in chroot, non-fatal)
 setupcon --force 2>/dev/null || true
 
@@ -1488,61 +2298,13 @@ systemctl enable zfs-zed
 # Mask TPM2 setup services — not used by ZFSBootMenu; avoids boot FAILED noise
 systemctl mask systemd-tpm2-setup-early.service systemd-tpm2-setup.service
 
+apt install -y zellij
+
+# Drop the install-time strict apt error mode (see top of this script)
+rm -f /etc/apt/apt.conf.d/30apt_error_on_transient
+
 # Take initial snapshot
 sanoid --take-snapshots --verbose
-
-# Docker install
-if [[ "$INSTALL_DOCKER" == "y" ]]; then
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-    chmod a+r /etc/apt/keyrings/docker.asc
-    CODENAME=\$(. /etc/os-release && echo "\${UBUNTU_CODENAME:-\$VERSION_CODENAME}")
-    ARCH=\$(dpkg --print-architecture)
-    cat > /etc/apt/sources.list.d/docker.sources << DOCKEREOF
-Types: deb
-URIs: https://download.docker.com/linux/ubuntu
-Suites: \${CODENAME}
-Components: stable
-Architectures: \${ARCH}
-Signed-By: /etc/apt/keyrings/docker.asc
-DOCKEREOF
-    apt update
-    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    echo "Docker \$(docker --version) installed"
-fi
-
-# Zellij install
-if [[ "$INSTALL_ZELLIJ" == "y" ]]; then
-    ZELLIJ_VERSION=\$(curl -s https://api.github.com/repos/zellij-org/zellij/releases/latest | grep -Po '"tag_name": "v\K[^"]*')
-    if [[ -z "\$ZELLIJ_VERSION" ]] || [[ ! "\$ZELLIJ_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "Warning: Could not fetch Zellij version, using fallback 0.43.1"
-        ZELLIJ_VERSION="0.43.1"
-    fi
-    ZELLIJ_ARCH=\$(uname -m)
-    case "\$ZELLIJ_ARCH" in
-        x86_64)  ZELLIJ_ARCH_SUFFIX="x86_64-unknown-linux-musl" ;;
-        aarch64) ZELLIJ_ARCH_SUFFIX="aarch64-unknown-linux-musl" ;;
-        *)
-            echo "Unsupported architecture '\$ZELLIJ_ARCH', skipping Zellij"
-            ZELLIJ_ARCH_SUFFIX="" ;;
-    esac
-    if [[ -n "\$ZELLIJ_ARCH_SUFFIX" ]]; then
-        if curl -L "https://github.com/zellij-org/zellij/releases/download/v\${ZELLIJ_VERSION}/zellij-\${ZELLIJ_ARCH_SUFFIX}.tar.gz" -o /tmp/zellij.tar.gz; then
-            tar -xzf /tmp/zellij.tar.gz -C /tmp
-            mv /tmp/zellij /usr/local/bin/
-            chmod +x /usr/local/bin/zellij
-            rm /tmp/zellij.tar.gz
-            echo "Zellij \$(zellij --version) installed"
-        else
-            echo "Warning: Failed to download Zellij, skipping"
-        fi
-    fi
-fi
-
-# Point /etc/resolv.conf at systemd-resolved stub resolver.
-# Done last so Docker/Zellij curl calls still work: /run is not bind-mounted
-# into the chroot, making the symlink target unreachable until first boot.
-ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
 EOF
 
@@ -1560,6 +2322,13 @@ EOF
     echo ""
     echo "Step 9: Creating user and setting passwords..."
 
+    # Shell environment → /etc/skel BEFORE useradd so the files are copied
+    # into the new home with correct ownership (no host-side chown needed)
+    mkdir -p /mnt/etc/skel/.config/zellij
+    write_zellij_config /mnt/etc/skel/.config/zellij/config.kdl
+    write_bash_aliases /mnt/etc/skel/.bash_aliases
+    echo "  ✓ Zellij config and bash aliases staged in /etc/skel"
+
     # Create user setup script with proper variable expansion
     # NOTE: Using unquoted EOF allows variable expansion (e.g., $USERNAME, $TIMEZONE)
     cat > /mnt/tmp/user-setup.sh << EOF
@@ -1569,8 +2338,6 @@ set -euo pipefail
 # Create user with sudo access and standard Ubuntu groups
 useradd -m -s /bin/bash -G sudo,adm,cdrom,dip,plugdev "$USERNAME"
 echo "User '$USERNAME' created with sudo access."
-# Add to docker group if docker was installed
-getent group docker &>/dev/null && usermod -aG docker "$USERNAME" || true
 
 # Lock root account
 passwd -l root
@@ -1595,17 +2362,8 @@ EOF
     # Set password via stdin — never written to disk, safe for all metacharacters
     printf '%s:%s\n' "$USERNAME" "$USER_PASSWORD" | chroot /mnt chpasswd
 
-    # Tabby SFTP integration: notify terminal of current directory on each prompt
-    # Written directly (not via chroot heredoc) to avoid quoting/expansion issues
-    cat >> "/mnt/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
-if [[ "$TERM_PROGRAM" == "Tabby" ]] || command -v tabby >/dev/null 2>&1; then
-    PS1="${PS1}\[\e]1337;CurrentDir=\w\a\]"
-fi
-PROFILE_EOF
-    # Resolve UID/GID from installed system (user doesn't exist on live host)
-    TARGET_UID=$(grep "^$USERNAME:" /mnt/etc/passwd | cut -d: -f3)
-    TARGET_GID=$(grep "^$USERNAME:" /mnt/etc/passwd | cut -d: -f4)
-    chown "$TARGET_UID:$TARGET_GID" "/mnt/home/$USERNAME/.bash_profile"
+    # Tabby SFTP integration is handled by _report_cwd in ~/.bash_aliases
+    # (staged in /etc/skel above), no per-user file writes needed here
     echo "  ✓ User setup completed"
 
     echo ""
@@ -1787,6 +2545,11 @@ EOF
     echo "Step 11: Configuring SSH..."
     chroot /mnt systemctl enable ssh
 
+    # Point /etc/resolv.conf at the systemd-resolved stub. Done from the host
+    # AFTER the last chroot that needs DNS (the file copied in Step 7 served
+    # them); the symlink target only exists once the new system boots.
+    ln -sf /run/systemd/resolve/stub-resolv.conf /mnt/etc/resolv.conf
+
     echo ""
     echo "Step 12: Setting ZFS properties for boot..."
     zpool set bootfs=rpool/ROOT/ubuntu-1 rpool
@@ -1847,8 +2610,7 @@ DATAPOOL_MOUNTPOINT="$DATAPOOL_MOUNTPOINT"
 DISK_SETUP_MODE="$DISK_SETUP_MODE"
 KEYBOARD_LAYOUT="$KEYBOARD_LAYOUT"
 KEYBOARD_VARIANT="$KEYBOARD_VARIANT"
-INSTALL_ZELLIJ="$INSTALL_ZELLIJ"
-INSTALL_DOCKER="$INSTALL_DOCKER"
+POSTREBOOT_DONE="n"
 EOF
     chmod 600 "$INSTALL_DIR/zbm-installer.conf"
     TARGET_UID=$(awk -F: -v user="$USERNAME" '$1==user {print $3}' /mnt/etc/passwd)
@@ -1907,7 +2669,8 @@ EOF
     echo "  1. Remove the USB drive"
     echo "  2. Reboot the system"
     echo "  3. Login as $USERNAME"
-    echo "  4. Run: sudo ~/zbm-installer/$(basename "$0") postreboot"
+    echo "  4. Run: sudo ~/zbm-installer/$(basename "$0")"
+    echo "     (mode is auto-detected; the 'postreboot' argument still works)"
     echo ""
     echo "Postreboot will:"
     echo "  - Set up Sanoid snapshot schedules"
@@ -1919,8 +2682,7 @@ EOF
             echo "  - Create the datapool ($DATAPOOL_NAME) on partition 4 of $DISK"
         fi
     fi
-    [[ "$INSTALL_ZELLIJ" == "y" ]] && echo "  - Install Zellij"
-    [[ "$INSTALL_DOCKER" == "y" ]] && echo "  - Install Docker"
+    echo "  - Ask about optional software (Docker, KVM/libvirt) and install it"
     echo ""
     echo "Reboot now? (y/n)"
     read -r response
@@ -1942,6 +2704,13 @@ elif [[ "$MODE" == "postreboot" ]]; then
         exit 1
     fi
 
+    # Log everything — this phase installs Docker/libvirt and creates pools, so
+    # a failure needs to be diagnosable after the terminal is gone.
+    # Started after the root check so a non-root run cannot fail on the log file.
+    POSTREBOOT_LOG="/var/log/zbm-postreboot.log"
+    exec > >(tee -a "$POSTREBOOT_LOG") 2>&1
+    echo "Post-reboot log: $POSTREBOOT_LOG"
+
     # Load persisted installation config from initial phase (co-located with this script)
     INSTALL_CONF="$(dirname "$0")/zbm-installer.conf"
     if [[ -f "$INSTALL_CONF" ]]; then
@@ -1949,8 +2718,10 @@ elif [[ "$MODE" == "postreboot" ]]; then
         source "$INSTALL_CONF"
         echo "  ✓ Loaded installation config from $INSTALL_CONF"
     else
-        echo "Warning: $INSTALL_CONF not found."
-        echo "Datapool creation will use DISK/DATAPOOL_NAME from script defaults."
+        echo "Error: $INSTALL_CONF not found."
+        echo "postreboot must run from the installer directory created during install:"
+        echo "  sudo ~/zbm-installer/$(basename "$0") postreboot"
+        exit 1
     fi
 
     validate_inputs
@@ -1970,6 +2741,13 @@ elif [[ "$MODE" == "postreboot" ]]; then
         echo "  ✓ Network connectivity verified"
     fi
 
+    # Flipped to 1 once the datapool is fully created/imported and configured.
+    # Until then a failure leaves a half-built pool that is better exported;
+    # afterwards exporting would drop it from /etc/zfs/zpool.cache, so a later
+    # unrelated failure (apt, docker, libvirt) would silently cost the user
+    # their pool on the next boot.
+    DATAPOOL_READY=0
+
     # Set up error handling for postreboot mode
     cleanup_postreboot() {
         echo ""
@@ -1977,9 +2755,11 @@ elif [[ "$MODE" == "postreboot" ]]; then
         echo "Error: Post-reboot setup failed!"
         echo "======================================================================"
 
-        # Try to export datapool if it was partially created
-        if [[ -n "${DATAPOOL_NAME:-}" ]]; then
+        # Try to export the datapool only if it was left partially created
+        if [[ -n "${DATAPOOL_NAME:-}" ]] && [[ "${DATAPOOL_READY:-0}" -eq 0 ]]; then
             zpool export "$DATAPOOL_NAME" 2>/dev/null || true
+        elif [[ -n "${DATAPOOL_NAME:-}" ]]; then
+            echo "Datapool '$DATAPOOL_NAME' is intact and stays imported."
         fi
 
         echo "The system is bootable but snapshot management may not be configured."
@@ -1993,28 +2773,52 @@ elif [[ "$MODE" == "postreboot" ]]; then
     systemctl enable --now cleanup-apt-snapshots.timer
     echo "  ✓ Sanoid and cleanup timers active"
 
-    # Optional: Create datapool if configured
+    # Optional: Create (or import) datapool if configured
     if [[ -n "$DATAPOOL_NAME" ]]; then
         echo ""
-        echo "Step 2: Creating datapool '$DATAPOOL_NAME'..."
+        echo "Step 2: Setting up datapool '$DATAPOOL_NAME'..."
 
-        # Select topology interactively; sets DATAPOOL_TOPOLOGY and DATAPOOL_DISK_IDS
-        select_datapool_topology_and_disks
+        # Offer importing an existing pool first. On import DATAPOOL_NAME and
+        # DATAPOOL_MOUNTPOINT are taken from the imported pool and the creation
+        # block below skips via its zpool-list check.
+        if offer_datapool_import; then
+            # Persist the (possibly different) pool name/mountpoint so re-runs
+            # of postreboot find the imported pool instead of trying to create
+            sed -i "s|^DATAPOOL_NAME=.*|DATAPOOL_NAME=\"$DATAPOOL_NAME\"|" "$INSTALL_CONF"
+            sed -i "s|^DATAPOOL_MOUNTPOINT=.*|DATAPOOL_MOUNTPOINT=\"$DATAPOOL_MOUNTPOINT\"|" "$INSTALL_CONF"
+        # Select topology interactively; sets DATAPOOL_TOPOLOGY and DATAPOOL_DISK_IDS.
+        # Returns 1 when no suitable extra disks exist (separate-disks mode).
+        elif ! select_datapool_topology_and_disks; then
+            read -rp "Continue without a datapool (software datasets will go on rpool)? [y/N]: " _ans
+            if [[ ! "$_ans" =~ ^[Yy]$ ]]; then
+                echo "Aborting. Attach the datapool disk(s) and re-run postreboot."
+                exit 1
+            fi
+            DATAPOOL_NAME=""    # skip pool creation this run; conf keeps the name
+        fi
+    fi
 
+    if [[ -n "$DATAPOOL_NAME" ]]; then
         # Create mount point
         echo "  - Creating mount point: $DATAPOOL_MOUNTPOINT"
         mkdir -p "$DATAPOOL_MOUNTPOINT"
 
-        # Create the pool (idempotent: skip if already imported)
-        echo "  - Creating ZFS pool: $DATAPOOL_NAME ($DATAPOOL_TOPOLOGY)"
+        # Create the pool (idempotent: skip if already imported — including
+        # pools just imported via offer_datapool_import)
         if zpool list "$DATAPOOL_NAME" &>/dev/null; then
             echo "  ✓ Datapool '$DATAPOOL_NAME' already imported, skipping creation"
         elif [[ "$DATAPOOL_TOPOLOGY" == "single" ]]; then
+            echo "  - Creating ZFS pool: $DATAPOOL_NAME (single)"
             if [[ "$DISK_SETUP_MODE" == "separate-disks" ]]; then
                 # Separate mode: "single" means 1 whole disk selected interactively
                 DISK_DATAPOOL_ID="${DATAPOOL_DISK_IDS[0]}"
                 echo "  - Using whole disk: $DISK_DATAPOOL_ID"
-                zpool create -o ashift=$ASHIFT \
+                if [[ ! -b "$DISK_DATAPOOL_ID" ]]; then
+                    echo "Error: Disk path not found: $DISK_DATAPOOL_ID"
+                    exit 1
+                fi
+                confirm_labelclear "$DISK_DATAPOOL_ID"
+                zpool create -f -o ashift=$ASHIFT \
                              -O compression=${COMPRESSION} \
                              -O atime=$ZFS_ATIME \
                              -O mountpoint="$DATAPOOL_MOUNTPOINT" \
@@ -2031,7 +2835,7 @@ elif [[ "$MODE" == "postreboot" ]]; then
                 fi
                 DISK_DATAPOOL_ID=$(resolve_part_byid "$DATAPOOL_PARTITION")
                 echo "  - Using partition: $DISK_DATAPOOL_ID"
-                zpool create -o ashift=$ASHIFT \
+                zpool create -f -o ashift=$ASHIFT \
                              -O compression=${COMPRESSION} \
                              -O atime=$ZFS_ATIME \
                              -O mountpoint="$DATAPOOL_MOUNTPOINT" \
@@ -2040,6 +2844,7 @@ elif [[ "$MODE" == "postreboot" ]]; then
             fi
         else
             # Multi-disk topology: use whole disks selected interactively
+            echo "  - Creating ZFS pool: $DATAPOOL_NAME ($DATAPOOL_TOPOLOGY)"
             echo "  - Disks: ${DATAPOOL_DISK_IDS[*]}"
 
             # Validate each resolved path is a block device
@@ -2050,20 +2855,11 @@ elif [[ "$MODE" == "postreboot" ]]; then
                 fi
             done
 
-            # Check for existing ZFS labels that would cause zpool create to refuse
-            for _id in "${DATAPOOL_DISK_IDS[@]}"; do
-                if zpool import -d "$_id" 2>/dev/null | grep -q "pool:"; then
-                    read -rp "  Disk $_id has an existing ZFS label. Clear it? [y/N]: " _clear_it
-                    if [[ "$_clear_it" =~ ^[Yy]$ ]]; then
-                        zpool labelclear -f "$_id"
-                    else
-                        echo "Error: Cannot create pool — existing label on $_id. Run: zpool labelclear -f $_id"
-                        exit 1
-                    fi
-                fi
-            done
+            # Check for existing ZFS labels that would be destroyed by -f
+            # (zpool import -d <device> requires modern OpenZFS — fine on 26.04)
+            confirm_labelclear "${DATAPOOL_DISK_IDS[@]}"
 
-            zpool create -o ashift=$ASHIFT \
+            zpool create -f -o ashift=$ASHIFT \
                          -O compression=${COMPRESSION} \
                          -O atime=$ZFS_ATIME \
                          -O mountpoint="$DATAPOOL_MOUNTPOINT" \
@@ -2086,66 +2882,63 @@ EOF
             echo "  ✓ Sanoid already configured for $DATAPOOL_NAME, skipping"
         fi
 
-        # Create Docker datasets and configure daemon.json (idempotent)
-        if [[ "$INSTALL_DOCKER" == "y" ]]; then
-            echo ""
-            if ! zpool list "$DATAPOOL_NAME" &>/dev/null; then
-                echo "  ⚠ Datapool '$DATAPOOL_NAME' not available — skipping Docker dataset/config setup"
-            else
-                echo "  - Creating Docker datasets under $DATAPOOL_NAME/docker..."
+        DATAPOOL_READY=1
 
-                # Parent dataset — inherits pool compression/atime
-                zfs list "$DATAPOOL_NAME/docker" &>/dev/null || \
-                    zfs create "$DATAPOOL_NAME/docker"
-
-                # dockerroot: Docker's data-root (overlay2 layers, images, containers)
-                #   recordsize=16K   — overlay2 writes in small blocks
-                #   xattr=sa         — required for overlay2
-                #   acltype=posixacl — required for overlay2
-                zfs list "$DATAPOOL_NAME/docker/dockerroot" &>/dev/null || \
-                    zfs create \
-                        -o recordsize=16K \
-                        -o xattr=sa \
-                        -o acltype=posixacl \
-                        "$DATAPOOL_NAME/docker/dockerroot"
-
-                # storage: external volume data mounted into containers
-                #   default recordsize (128K) suits mixed file sizes
-                zfs list "$DATAPOOL_NAME/docker/storage" &>/dev/null || \
-                    zfs create "$DATAPOOL_NAME/docker/storage"
-
-                # stack: docker-compose files (small text files)
-                #   recordsize=4K — minimises wasted space for tiny config files
-                zfs list "$DATAPOOL_NAME/docker/stack" &>/dev/null || \
-                    zfs create \
-                        -o recordsize=4K \
-                        "$DATAPOOL_NAME/docker/stack"
-
-                echo "  ✓ Docker datasets created"
-
-                # Point Docker data-root at the ZFS dataset (idempotent)
-                DOCKER_ROOT="$DATAPOOL_MOUNTPOINT/docker/dockerroot"
-                DAEMON_JSON="/etc/docker/daemon.json"
-                if [[ ! -f "$DAEMON_JSON" ]] || ! grep -q "data-root" "$DAEMON_JSON"; then
-                    echo "  - Configuring Docker data-root → $DOCKER_ROOT"
-                    mkdir -p /etc/docker
-                    cat > "$DAEMON_JSON" << DOCKEREOF
-{
-    "data-root": "$DOCKER_ROOT",
-    "storage-driver": "overlay2"
-}
-DOCKEREOF
-                    systemctl restart docker
-                    echo "  ✓ Docker data-root set to $DOCKER_ROOT"
-                else
-                    echo "  ✓ Docker daemon.json already configured, skipping"
-                fi
-            fi
-        fi
     else
         echo ""
         echo "Step 2: Skipping datapool creation (DATAPOOL_NAME not set)"
     fi
+
+    echo ""
+    echo "Step 3: Optional software selection..."
+    prompt_postreboot_software
+
+    # Storage target for software datasets: single data pool → used directly,
+    # several pools → user chooses, none → rpool fallback
+    STORAGE_POOL="rpool"
+    STORAGE_BASE=""
+
+    if [[ "$INSTALL_DOCKER" == "y" || "$INSTALL_VIRT" == "y" ]]; then
+        select_storage_pool
+        echo ""
+        echo "Step 4: Creating software datasets on $STORAGE_POOL..."
+        create_software_datasets "$STORAGE_POOL" "$STORAGE_BASE"
+
+        # User-writable data areas; dockerroot and VM image storage stay
+        # root-owned (managed by dockerd/libvirtd)
+        if [[ "$STORAGE_POOL" != "rpool" ]]; then
+            chown "$USERNAME:$USERNAME" "$STORAGE_BASE"
+        fi
+        if [[ "$INSTALL_DOCKER" == "y" ]]; then
+            chown "$USERNAME:$USERNAME" \
+                "$STORAGE_BASE/docker" \
+                "$STORAGE_BASE/docker/storage" \
+                "$STORAGE_BASE/docker/stack"
+        fi
+    fi
+
+    if [[ "$INSTALL_DOCKER" == "y" ]]; then
+        echo ""
+        echo "Step 5: Installing Docker Engine..."
+        install_docker_postreboot
+    fi
+
+    if [[ "$INSTALL_VIRT" == "y" ]]; then
+        echo ""
+        echo "Step 6: Installing KVM/libvirt virtualization..."
+        install_virtualization_postreboot
+    fi
+
+    # Written only after everything above succeeded, so a failed run keeps
+    # mode auto-detection pointing at postreboot for a re-run
+    echo ""
+    echo "Step 7: Recording postreboot completion..."
+    if grep -q '^POSTREBOOT_DONE=' "$INSTALL_CONF"; then
+        sed -i 's/^POSTREBOOT_DONE=.*/POSTREBOOT_DONE="y"/' "$INSTALL_CONF"
+    else
+        echo 'POSTREBOOT_DONE="y"' >> "$INSTALL_CONF"
+    fi
+    echo "  ✓ Completion marker written to $INSTALL_CONF"
 
     echo ""
     echo "======================================================================"
@@ -2165,19 +2958,23 @@ DOCKEREOF
     echo "  - ZFSBootMenu installed and configured"
     echo ""
     echo "Next steps:"
-    echo "  1. Use 'passwd' to change your password if needed"
-    if [[ -n "$DATAPOOL_NAME" ]]; then
-        if [[ "$INSTALL_DOCKER" == "y" ]]; then
-            echo "  2. Docker datasets created automatically:"
-            echo "       $DATAPOOL_NAME/docker/dockerroot  ← Docker data-root (images, containers)"
-            echo "       $DATAPOOL_NAME/docker/storage     ← External container data"
-            echo "       $DATAPOOL_NAME/docker/stack       ← Docker Compose project files"
-        else
-            echo "  2. Create datasets in $DATAPOOL_NAME as needed (e.g. zfs create $DATAPOOL_NAME/data)"
-        fi
-    else
-        echo "  2. No datapool configured. Re-run with DATAPOOL_NAME set if needed later."
+    echo "  - Use 'passwd' to change your password if needed"
+    if [[ "$INSTALL_DOCKER" == "y" ]]; then
+        echo "  - Docker datasets created automatically:"
+        echo "      $STORAGE_POOL/docker/dockerroot  ← Docker data-root (images, containers)"
+        echo "      $STORAGE_POOL/docker/storage     ← External container data"
+        echo "      $STORAGE_POOL/docker/stack       ← Docker Compose project files"
+    elif [[ -n "$DATAPOOL_NAME" ]]; then
+        echo "  - Create datasets in $DATAPOOL_NAME as needed (e.g. zfs create $DATAPOOL_NAME/data)"
     fi
+    if [[ "$INSTALL_VIRT" == "y" ]]; then
+        echo "  - libvirt 'default' storage pool: $VIRT_STORAGE_DIR"
+        echo "    Connect remotely with virt-manager via qemu+ssh://$USERNAME@<this-host>/system"
+    fi
+    if [[ "$INSTALL_DOCKER" == "y" || "$INSTALL_VIRT" == "y" ]]; then
+        echo "  - Re-login (or reboot) so docker/libvirt group membership takes effect"
+    fi
+    echo "  - Re-run this script with no argument any time to update ZFSBootMenu"
     echo ""
     echo "Snapshot management:"
     echo "  - View snapshots: zfs list -t snapshot"
@@ -2259,6 +3056,14 @@ elif [[ "$MODE" == "reinstall-zbm" ]]; then
         mv "$ZBM_SRC" "${ZBM_SRC}.bak.$(date +%Y%m%d-%H%M%S)"
         echo "  - Backed up existing source dir"
     fi
+
+    # Keep only the 2 newest backups — the timestamp suffix sorts chronologically
+    mapfile -t _old_baks < <(find "$(dirname "$ZBM_SRC")" -maxdepth 1 -type d \
+        -name "$(basename "$ZBM_SRC").bak.*" 2>/dev/null | sort -r | tail -n +3)
+    for _bak in ${_old_baks[@]+"${_old_baks[@]}"}; do
+        rm -rf "$_bak"
+        echo "  - Removed old backup: $_bak"
+    done
     mkdir -p "$ZBM_SRC"
     git clone --depth 1 --branch "$ZBM_VERSION" https://github.com/zbm-dev/zfsbootmenu "$ZBM_SRC"
     cd "$ZBM_SRC"
@@ -2293,6 +3098,6 @@ elif [[ "$MODE" == "reinstall-zbm" ]]; then
 
 else
     echo "Invalid mode: $MODE"
-    echo "Usage: $0 {initial|postreboot|reinstall-zbm}"
+    echo "Usage: $0 [initial|postreboot|reinstall-zbm]  (no argument = auto-detect)"
     exit 1
 fi

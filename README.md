@@ -405,6 +405,30 @@ For issues or questions:
 
 ## 🔄 Version History
 
+### Version 3.0.50 (2026-08-18)
+- 🐛 **Fix fatal `((retry++))`** in the partition-verification loop — it returns exit status 1 when `retry` is 0, so `set -e` aborted the whole install (unmounting `/mnt`, exporting `rpool`) on the very first slow-udev retry
+- 🐛 Fix ~20% of the disk being left unpartitioned when the user declines a datapool — rpool now takes all remaining space
+- 🐛 Ask before destroying an existing pool on the separate-disks *single* path too (`confirm_labelclear()` now covers every `zpool create -f`)
+- 🐛 `cleanup_postreboot` no longer exports a finished datapool on an unrelated later failure (that dropped it from `zpool.cache`, so it would not auto-import on the next boot)
+- 🐛 libvirt setup made non-fatal: fall back to the modular `virtqemud`/`virtnetworkd`/`virtstoraged` sockets when `libvirtd.service` is absent, and add the missing `apt update` for KVM-only runs
+- 🐛 `validate_inputs` no longer clobbers a `DATAPOOL_MOUNTPOINT` loaded from `zbm-installer.conf` (imported pools with a custom mountpoint)
+- 🐛 Reject swap size `0` at the prompt instead of hard-failing in validation after all remaining questions
+- 🐛 Anchor the disk-name match in `zpool import` so `sda` no longer matches `sdaa`
+- 📦 APT sources switched to deb822 (`/etc/apt/sources.list.d/ubuntu.sources`); legacy `sources.list` neutralised so suites cannot be configured twice
+- 📦 `APT::Update::Error-Mode "any"` is now install-time only — removed at the end of the chroot so the installed system keeps a normal `apt update`
+- 📋 Post-reboot phase logs to `/var/log/zbm-postreboot.log`
+- 🐳 Docker re-runs now compare and offer to repoint `data-root` instead of skipping silently; existing image/container data is never moved automatically
+- 🧹 `reinstall-zbm` keeps only the 2 newest `/usr/local/src/zfsbootmenu.bak.*` directories
+- 💬 Disk-selection header and confirmation table no longer mention a datapool/partition 4 that is not being created
+
+### Version 3.0.49 (2026-07-18)
+- ✨ Flagless auto-detect (`detect_mode()`): the script picks initial / postreboot / reinstall-zbm itself; explicit positional arg still overrides
+- ✨ Optional software prompted and installed in postreboot: Docker Engine (official apt repo) and headless KVM/libvirt
+- ✨ `select_storage_pool()` / `create_software_datasets()` place `docker/{dockerroot,storage,stack}` and `virtmanager/storage` on the datapool, or on rpool with explicit mountpoints when no datapool exists
+- ✨ `offer_datapool_import()` — import an existing exported pool as the datapool instead of creating a new one
+- ✨ Zellij config and bash aliases staged in `/etc/skel` before `useradd`
+- 🔒 `POSTREBOOT_DONE` marker in `zbm-installer.conf`, written only after postreboot fully succeeds
+
 ### Version 3.0.48 (2026-05-07)
 - 🗂️ Disk selection menu: selected disks are removed from the list after each pick (no duplicate-selection possible)
 
@@ -448,7 +472,7 @@ For issues or questions:
 
 ### Version 3.0.3 (2026-03-03)
 - 🔒 Encrypted swap (ephemeral random key per boot via crypttab)
-- 📋 Persistent install log (`/var/log/zbm-install.log`, copied into installed system)
+- 📋 Persistent install log (`/var/log/zbm-install.log`, copied into installed system) and post-reboot log (`/var/log/zbm-postreboot.log`)
 - ⚡ IPv4 preference for apt (avoids slow/unreachable IPv6 Ubuntu mirrors)
 - 🛡️ EFI environment check at startup (fails fast on BIOS/legacy systems)
 - 🗂️ `/tmp` mounted as tmpfs (not snapshotted, lower ZFS CoW overhead)
