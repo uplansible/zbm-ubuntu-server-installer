@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.53
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.57
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -46,6 +46,7 @@ DISK_DATAPOOL=""                        # Set only in single-disk mode; empty in
 DISK_DATAPOOL_ID=""                    # Resolved after partition creation; empty when DATAPOOL_NAME=""
 DATAPOOL_TOPOLOGY=""                   # Set by select_datapool_topology_and_disks()
 DATAPOOL_DISK_IDS=()
+DATAPOOL_ADOPTED=0                      # 1 when the datapool was imported rather than created
 DISK_SETUP_MODE=""                     # "single-disk" or "separate-disks"; set during interactive config
 
 # Optional software (all prompted during postreboot, not initial)
@@ -53,6 +54,15 @@ DISK_SETUP_MODE=""                     # "single-disk" or "separate-disks"; set 
 INSTALL_DOCKER=""    # y/n — Docker Engine via official apt repo
 INSTALL_PODMAN=""    # y/n — rootless Podman from the Ubuntu archive
 INSTALL_VIRT=""      # y/n — KVM/libvirt headless virtualization
+# Storage & encryption
+INSTALL_ZFSKEY=""    # y/n — mount a removable key volume, load ZFS keys from it at boot
+ZFSKEY_LABEL="gerg"  # filesystem LABEL of that volume (mounted by label, never by device)
+ZFSKEY_MOUNT=""      # mount point; derived from the label when empty
+INSTALL_ZFSCRYPT=""  # y/n — create or adopt an encrypted dataset unlocked from that volume
+ZFSCRYPT_DATASET=""  # dataset to encrypt, e.g. ssdupl/daten
+ZFSCRYPT_KEYFILE=""  # raw key file on the volume; derived from the label when empty
+ZFSCRYPT_MODE=""     # adopt | create-existing-key | create-new-key — asked, never inferred
+ZFSCRYPT_KEY_IS_NEW=0 # 1 when this run generated the key — drives the "back it up" warning
 # System health & updates
 INSTALL_HEALTH=""    # y/n — smartmontools, ZED mail alerts, monthly scrub timers
 INSTALL_UNATTENDED="" # y/n — unattended-upgrades (security updates)
@@ -168,6 +178,8 @@ configure_interactively() {
     echo ""
 
     local input
+    # Assigned indirectly by ask_read (printf -v), so declare it here
+    local pw_confirm=""
 
     # Hostname
     read -rp "Hostname [$HOSTNAME]: " input
@@ -181,12 +193,17 @@ configure_interactively() {
         USERNAME="$input"
     fi
 
-    # Password (prompted silently, confirmed)
+    # Password (prompted silently, confirmed).
+    # ask_read turns EOF into a hard error: a bare `read` returns empty on EOF,
+    # both fields would then "match" and the account would be created with an
+    # empty password.
     while true; do
-        read -rsp "Password for $USERNAME: " USER_PASSWORD
-        echo ""
-        read -rsp "Confirm password: " pw_confirm
-        echo ""
+        ask_read "Password for $USERNAME: " USER_PASSWORD -s
+        ask_read "Confirm password: " pw_confirm -s
+        if [[ -z "$USER_PASSWORD" ]]; then
+            echo "Password must not be empty. Please try again."
+            continue
+        fi
         if [[ "$USER_PASSWORD" == "$pw_confirm" ]]; then
             break
         fi
@@ -297,7 +314,7 @@ configure_interactively() {
         echo "                     (single whole disk / mirror / raidz)"
         local mode_choice
         while true; do
-            read -rp "Select disk setup [1/2]: " mode_choice
+            ask_read "Select disk setup [1/2]: " mode_choice
             case "$mode_choice" in
                 1) DISK_SETUP_MODE="single-disk";   break ;;
                 2) DISK_SETUP_MODE="separate-disks"; break ;;
@@ -537,7 +554,7 @@ select_disk() {
     echo ""
     local choice
     while true; do
-        read -rp "Select disk number [1-${#names[@]}]: " choice
+        ask_read "Select disk number [1-${#names[@]}]: " choice
         if [[ "$choice" =~ ^[0-9]+$ ]] && \
            [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#names[@]} ]]; then
             break
@@ -560,13 +577,17 @@ select_datapool_topology_and_disks() {
     # say why up front. `zpool status -P` prints full device paths; the leading
     # /dev/disk/by-id symlinks are resolved back to their kernel names.
     local -a busy_names=()
-    local _line _dev _base _pool_of_dev
+    local _line _dev _base _parent _pool_of_dev
     while IFS= read -r _line; do
         _dev=$(awk '{print $1}' <<< "$_line")
         [[ "$_dev" == /* ]] || continue
         _base=$(basename "$(readlink -f "$_dev" 2>/dev/null || echo "$_dev")")
-        # partition -> parent disk (sda3 -> sda, nvme0n1p3 -> nvme0n1)
-        _base=$(lsblk -no PKNAME "/dev/$_base" 2>/dev/null | head -1 || true)
+        # partition -> parent disk (sda3 -> sda, nvme0n1p3 -> nvme0n1).
+        # A vdev that is a whole device has no PKNAME — keep its own name then,
+        # or the disk would not be recognised as busy and `zpool create` would
+        # refuse it only after the entire selection was made.
+        _parent=$(lsblk -no PKNAME "/dev/$_base" 2>/dev/null | head -1 || true)
+        [[ -n "$_parent" ]] && _base="$_parent"
         [[ -n "$_base" ]] && busy_names+=("$_base")
     done < <(zpool status -LP 2>/dev/null || true)
 
@@ -867,7 +888,7 @@ select_rpool_percent() {
 
     local pct
     while true; do
-        read -rp "Enter rpool percentage (1-99) [default: ${RPOOL_PERCENT}]: " pct
+        ask_read "Enter rpool percentage (1-99) [default: ${RPOOL_PERCENT}]: " pct
         # Use default if empty
         if [[ -z "$pct" ]]; then
             pct=$RPOOL_PERCENT
@@ -886,7 +907,7 @@ select_rpool_percent() {
             echo "Warning: ${pct}% of available space is only $(( rpool_mib / 1024 ))GiB."
             echo "This may be too small for a functional system (recommended: at least 10GiB)."
             local yn
-            read -rp "Continue anyway? [y/N]: " yn
+            ask_read "Continue anyway? [y/N]: " yn
             if [[ ! "$yn" =~ ^[Yy]$ ]]; then
                 continue
             fi
@@ -1361,12 +1382,20 @@ uhoh() {
     sudo bash -c "$last"
 }
 
+# Ubuntu's stock .bashrc defines ll/la/l and the colored greps.
+# Trailing space: bash also alias-expands the word after sudo, so `sudo ll` works.
+alias sudo='sudo '
+
 # History: large, deduplicated, shared across zellij panes
 # (overrides the stock .bashrc values; histappend is already set there)
 HISTSIZE=100000
 HISTFILESIZE=200000
 HISTCONTROL=ignoreboth:erasedups
+HISTTIMEFORMAT='%F %T '
 PROMPT_COMMAND="history -a${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+
+# ** matches across subdirectories; cd fixes small typos in directory names
+shopt -s globstar cdspell
 
 # Terminal CWD reporting for Tabby SFTP panel sync.
 # Inside Zellij over SSH: emit custom OSC 7727 directly to the outer SSH PTY
@@ -1389,6 +1418,28 @@ _report_cwd() {
     fi
 }
 PROMPT_COMMAND="_report_cwd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+
+# Prompt, rebuilt before every command: "[rc] user@host:dir (branch)$ ".
+# [rc] is the last exit code, shown only when it failed; user@host turns red
+# for root; (branch) appears inside a git work tree. Also sets the terminal
+# title to "user@host: dir". _set_prompt has to run first in PROMPT_COMMAND
+# to see the command's $?, hence it is prepended last.
+_git_branch() {
+    local b
+    command -v git >/dev/null || return 0
+    b=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null) || return 0
+    printf ' (%s)' "$b"
+}
+_set_prompt() {
+    local rc=$? user_color='01;32'
+    (( EUID == 0 )) && user_color='01;31'
+    PS1='\[\e]0;\u@\h: \w\a\]'
+    (( rc != 0 )) && PS1+="\[\e[01;31m\][$rc]\[\e[00m\] "
+    # $(_git_branch) stays literal here and runs at prompt time: its output is
+    # not expanded again, so a crafted branch name cannot inject commands.
+    PS1+="\[\e[${user_color}m\]\u@\h\[\e[00m\]:\[\e[01;34m\]\w\[\e[00m\]\[\e[33m\]\$(_git_branch)\[\e[00m\]\\\$ "
+}
+PROMPT_COMMAND="_set_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 ALIASES_EOF
 }
 ################################################################################
@@ -1468,6 +1519,101 @@ prompt_postreboot_software() {
         if [[ "$INSTALL_DOCKER" == "y" ]] && command -v docker &>/dev/null; then
             prompt_docker_repoint "$STORAGE_BASE/docker/dockerroot"
         fi
+    fi
+
+    echo ""
+    echo "  [Storage & encryption]"
+    local _in _keydef="n" _dsdef _kfdef
+    [[ -f /etc/systemd/system/zfs-load-key.service ]] && _keydef="y"
+    ask_yn "Mount a removable key volume and load ZFS keys from it at boot?" "$_keydef" INSTALL_ZFSKEY
+    if [[ "$INSTALL_ZFSKEY" == "y" ]]; then
+        echo "    Labelled filesystems attached right now:"
+        zfskey_list_candidates
+        ask_read "    Filesystem LABEL of the key volume [${ZFSKEY_LABEL:-gerg}]: " _in
+        [[ -n "$_in" ]] && ZFSKEY_LABEL="$_in"
+        [[ -z "$ZFSKEY_LABEL" ]] && ZFSKEY_LABEL="gerg"
+        # The label goes into an fstab path; keep it to characters that need no
+        # escaping there.
+        if [[ ! "$ZFSKEY_LABEL" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "    ⚠ '$ZFSKEY_LABEL' is not usable in an fstab path — using 'gerg'."
+            ZFSKEY_LABEL="gerg"
+        fi
+        ask_read "    Mount point [${ZFSKEY_MOUNT:-/opt/$ZFSKEY_LABEL}]: " _in
+        [[ -n "$_in" ]] && ZFSKEY_MOUNT="$_in"
+        [[ -z "$ZFSKEY_MOUNT" ]] && ZFSKEY_MOUNT="/opt/$ZFSKEY_LABEL"
+        if [[ ! "$ZFSKEY_MOUNT" =~ ^/[A-Za-z0-9._/-]*$ ]]; then
+            echo "    ⚠ '$ZFSKEY_MOUNT' is not a usable path — using /opt/$ZFSKEY_LABEL."
+            ZFSKEY_MOUNT="/opt/$ZFSKEY_LABEL"
+        fi
+
+        ask_yn "Create or adopt an encrypted dataset unlocked from that volume?" n INSTALL_ZFSCRYPT
+        if [[ "$INSTALL_ZFSCRYPT" == "y" ]]; then
+            _dsdef="${ZFSCRYPT_DATASET:-${DATAPOOL_NAME:-rpool}/daten}"
+            while true; do
+                ask_read "    Dataset to encrypt [$_dsdef]: " _in
+                [[ -z "$_in" ]] && _in="$_dsdef"
+                # Must name a child, not a pool root: a pool root cannot be
+                # encrypted after creation, and encrypting rpool itself is a
+                # different (and much bigger) decision than this option makes.
+                if [[ "$_in" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]*(/[A-Za-z0-9_.:-]+)+$ ]]; then
+                    ZFSCRYPT_DATASET="$_in"; break
+                fi
+                echo "    Not a dataset name below a pool (expected e.g. ssdupl/daten)."
+            done
+            _kfdef="${ZFSCRYPT_KEYFILE:-$ZFSKEY_MOUNT/$ZFSKEY_LABEL.bin}"
+            while true; do
+                ask_read "    Key file on the volume [$_kfdef]: " _in
+                [[ -z "$_in" ]] && _in="$_kfdef"
+                # The key belongs on the removable volume; anywhere else and it
+                # travels with the machine, which defeats the whole arrangement.
+                if [[ "$_in" == "$ZFSKEY_MOUNT"/* && "$_in" =~ ^/[A-Za-z0-9._/-]+$ \
+                      && "$_in" != *"/../"* && "$_in" != *"/.." ]]; then
+                    ZFSCRYPT_KEYFILE="$_in"; break
+                fi
+                echo "    The key file must sit under $ZFSKEY_MOUNT (no '..')."
+            done
+
+            # Which of the three jobs Step 5 should do is ASKED, never inferred
+            # from what happens to lie on disk. Guessing from "does the key file
+            # exist" is how an existing key gets overwritten, and overwriting a
+            # key file destroys every dataset that uses it — backups included.
+            echo ""
+            echo "    What Step 5 finds right now:"
+            zfscrypt_probe_state "$ZFSCRYPT_DATASET" "$ZFSCRYPT_KEYFILE"
+            echo ""
+            echo "    [1] Adopt an existing encrypted dataset — point it at the key file"
+            echo "        on the volume (the case after reinstalling onto an imported pool)"
+            echo "    [2] Create a new encrypted dataset — reuse the key file on the volume"
+            echo "    [3] Create a new encrypted dataset — generate a NEW key file"
+            # Suggest what the machine's state implies, but make the operator confirm it.
+            local _modedef=3
+            if zfs list -H -o name "$ZFSCRYPT_DATASET" &>/dev/null; then
+                _modedef=1
+            elif mountpoint -q "$ZFSKEY_MOUNT" 2>/dev/null && [[ -s "$ZFSCRYPT_KEYFILE" ]]; then
+                _modedef=2
+            fi
+            case "${ZFSCRYPT_MODE:-}" in
+                adopt)              _modedef=1 ;;
+                create-existing-key) _modedef=2 ;;
+                create-new-key)     _modedef=3 ;;
+            esac
+            while true; do
+                ask_read "    Choose [1-3, default $_modedef]: " _in
+                [[ -z "$_in" ]] && _in="$_modedef"
+                case "$_in" in
+                    1) ZFSCRYPT_MODE="adopt"; break ;;
+                    2) ZFSCRYPT_MODE="create-existing-key"; break ;;
+                    3) ZFSCRYPT_MODE="create-new-key"; break ;;
+                esac
+                echo "    Enter 1, 2 or 3."
+            done
+            if [[ "$ZFSCRYPT_MODE" == "create-new-key" ]]; then
+                echo "    → A new key will be generated. It will exist in exactly one place"
+                echo "      until you copy it off; nothing can recover it."
+            fi
+        fi
+    else
+        INSTALL_ZFSCRYPT="n"
     fi
 
     echo ""
@@ -1629,6 +1775,8 @@ persist_conf_var() {
 persist_postreboot_selection() {
     local v
     for v in INSTALL_DOCKER INSTALL_PODMAN INSTALL_VIRT INSTALL_HEALTH \
+             INSTALL_ZFSKEY ZFSKEY_LABEL ZFSKEY_MOUNT \
+             INSTALL_ZFSCRYPT ZFSCRYPT_DATASET ZFSCRYPT_KEYFILE ZFSCRYPT_MODE \
              INSTALL_UNATTENDED INSTALL_MTA INSTALL_TAILSCALE HARDEN_SSH \
              HARDEN_SSH_FORCE INSTALL_UFW INSTALL_FAIL2BAN INSTALL_NUT \
              INSTALL_COCKPIT INSTALL_SAMBA INSTALL_NFS INSTALL_NODEEXP \
@@ -1643,14 +1791,15 @@ persist_postreboot_selection() {
 # Destination address for smartd, ZED, fail2ban and unattended-upgrades mail.
 # "root" (the local mailbox) is the fallback when nothing is entered.
 prompt_admin_email() {
-    if [[ -n "$ADMIN_EMAIL" ]]; then
-        return 0
-    fi
-    local input
+    # A value carried over from zbm-installer.conf is offered as the default
+    # rather than skipping the question — returning early here meant the address
+    # could never be corrected on a re-run once it had been persisted.
+    local input hint="empty = local 'root' mailbox"
+    [[ -n "$ADMIN_EMAIL" ]] && hint="empty = keep $ADMIN_EMAIL"
     while true; do
-        ask_read "    Admin e-mail for alerts (empty = local 'root' mailbox): " input
+        ask_read "    Admin e-mail for alerts ($hint): " input
         if [[ -z "$input" ]]; then
-            ADMIN_EMAIL="root"
+            ADMIN_EMAIL="${ADMIN_EMAIL:-root}"
             return 0
         fi
         if [[ "$input" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
@@ -1948,17 +2097,38 @@ install_docker_postreboot() {
 }
 DOCKEREOF
 
-    # 2. Docker's official apt repo
+    # 2. Docker's official apt repo.
+    #    The suite is probed before it is written, exactly like the Tailscale
+    #    step: download.docker.com trails new Ubuntu releases, and an apt line
+    #    pointing at a suite that does not exist makes `apt update` fail hard —
+    #    which under set -e aborts postreboot AND leaves a broken sources file
+    #    behind that breaks every later apt run on the machine.
+    local codename arch suite="" c
+    codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")
+    for c in "$codename" noble; do
+        [[ -n "$c" ]] || continue
+        if curl -fsI "https://download.docker.com/linux/ubuntu/dists/${c}/Release" >/dev/null 2>&1; then
+            suite="$c"
+            break
+        fi
+    done
+    if [[ -z "$suite" ]]; then
+        echo "  ⚠ No Docker apt suite found for '$codename' — skipping Docker installation."
+        echo "    Install manually later: curl -fsSL https://get.docker.com | sh"
+        return 0
+    fi
+    if [[ "$suite" != "$codename" ]]; then
+        echo "  - No '$codename' suite on download.docker.com yet, using '$suite'"
+    fi
+
     install -m 0755 -d /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
     chmod a+r /etc/apt/keyrings/docker.asc
-    local codename arch
-    codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
     arch=$(dpkg --print-architecture)
     cat > /etc/apt/sources.list.d/docker.sources << SRCEOF
 Types: deb
 URIs: https://download.docker.com/linux/ubuntu
-Suites: $codename
+Suites: $suite
 Components: stable
 Architectures: $arch
 Signed-By: /etc/apt/keyrings/docker.asc
@@ -2211,6 +2381,289 @@ ZEDEOF
     fi
 }
 
+# --- ZFS key volume ---------------------------------------------------------
+# The wrapping key of an encrypted dataset lives on a removable volume, not on
+# the machine: pull the stick and what is left is ciphertext. Everything in
+# these two functions is about getting that volume mounted before ZFS wants the
+# key, and about making a missing stick loud rather than silent.
+
+# systemd's name for the .mount unit of a path (/opt/gerg -> opt-gerg.mount).
+# zfs-load-key must be ordered after that unit, so the name has to be exact —
+# hand-building it from the path gets the escaping wrong for anything unusual.
+zfskey_mount_unit() {
+    systemd-escape -p --suffix=mount "$1"
+}
+
+# Labelled filesystems currently attached, so the label prompt is a choice
+# rather than a guess.
+zfskey_list_candidates() {
+    local link found=0
+    for link in /dev/disk/by-label/*; do
+        [[ -e "$link" ]] || continue
+        printf '      %-24s -> %s\n' "$(basename "$link")" "$(readlink -f "$link")"
+        found=1
+    done
+    (( found )) || echo "      (none attached — plug the volume in and re-run this step)"
+}
+
+# What Step 5 would find right now, printed before the operator picks what it
+# should do. The datapool is imported by Step 2, so the dataset check is
+# reliable; the key volume may not be mounted until Step 4, and then this says
+# so rather than guessing.
+zfscrypt_probe_state() {
+    local ds="$1" keyfile="$2" enc status
+    printf '      dataset   %-30s ' "$ds"
+    if zfs list -H -o name "$ds" &>/dev/null; then
+        enc=$(zfs get -H -o value encryption "$ds" 2>/dev/null || echo "?")
+        if [[ "$enc" == "off" ]]; then
+            echo "exists, NOT encrypted"
+        else
+            status=$(zfs get -H -o value keystatus "$ds" 2>/dev/null || echo "?")
+            echo "exists, encrypted, key $status"
+        fi
+    else
+        echo "does not exist"
+    fi
+    printf '      key file  %-30s ' "$keyfile"
+    if ! mountpoint -q "$ZFSKEY_MOUNT" 2>/dev/null; then
+        echo "unknown — $ZFSKEY_MOUNT not mounted yet (Step 4 does that)"
+    elif [[ -s "$keyfile" ]]; then
+        echo "present, $(stat -c %s "$keyfile" 2>/dev/null) bytes"
+    elif [[ -e "$keyfile" ]]; then
+        echo "present but EMPTY"
+    else
+        echo "not present"
+    fi
+}
+
+install_zfskey_postreboot() {
+    local label="$ZFSKEY_LABEL" mnt="$ZFSKEY_MOUNT"
+    local dev="/dev/disk/by-label/$label"
+    local unit
+    unit="$(zfskey_mount_unit "$mnt")"
+
+    mkdir -p "$mnt"
+
+    # fstab entry inside the managed block, so a re-run replaces it instead of
+    # appending a second, conflicting line.
+    #   by-label  — the device name of a removable volume is not stable
+    #   nofail    — a missing volume must not strand the machine in emergency mode
+    #   nosuid,nodev,noexec — it only ever holds a key file
+    strip_managed_block /etc/fstab
+    cat >> /etc/fstab << FSTABEOF
+$ZBM_BLOCK_START
+# ZFS key volume — read by zfs-load-key.service before zfs-mount.service
+/dev/disk/by-label/$label $mnt auto nosuid,nodev,noexec,nofail,x-systemd.device-timeout=15 0 0
+$ZBM_BLOCK_END
+FSTABEOF
+    systemctl daemon-reload
+
+    if [[ -e "$dev" ]]; then
+        if mountpoint -q "$mnt" || mount "$mnt" 2>/dev/null; then
+            echo "  ✓ Key volume '$label' mounted at $mnt"
+        else
+            echo "  ⚠ Could not mount $dev at $mnt — check the filesystem on the volume."
+        fi
+    else
+        echo "  ⚠ No filesystem labelled '$label' is attached right now."
+        echo "    The fstab entry is in place and will mount it when it appears."
+    fi
+
+    # Why not plain `zfs load-key -a`: on a machine that also receives raw
+    # encrypted datasets (a backup target), those carry keylocation=prompt on
+    # purpose — their key is deliberately absent. `-a` would try them, block on
+    # stdin or fail, and take the whole unit down with it every boot. Load only
+    # what has a file:// key location and is still locked.
+    cat > /usr/local/sbin/zbm-zfs-load-keys << 'LOADEOF'
+#!/bin/sh
+# Load every ZFS key whose keylocation is a file:// URI and that is still
+# locked. Datasets with keylocation=prompt are skipped deliberately: on a
+# backup target those are raw-received copies whose key is meant to be absent.
+set -u
+rc=0
+for ds in $(zfs list -H -o name,keylocation,keystatus 2>/dev/null \
+            | awk -F'\t' '$2 ~ /^file:\/\// && $3 == "unavailable" { print $1 }'); do
+    if zfs load-key "$ds"; then
+        echo "loaded key: $ds"
+    else
+        echo "failed to load key: $ds" >&2
+        rc=1
+    fi
+done
+exit "$rc"
+LOADEOF
+    chmod +x /usr/local/sbin/zbm-zfs-load-keys
+
+    # Requires= (not Wants=) on the mount unit is the point: fstab's `nofail`
+    # keeps the machine bootable without the volume, and this unit is what then
+    # turns "key volume missing" into a failed unit you can see and alert on,
+    # instead of an empty mountpoint that services happily write into.
+    cat > /etc/systemd/system/zfs-load-key.service << KEYEOF
+[Unit]
+Description=Load ZFS encryption keys from $mnt
+Documentation=man:zfs-load-key(8)
+DefaultDependencies=no
+After=zfs-import.target $unit
+Requires=$unit
+Before=zfs-mount.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/zbm-zfs-load-keys
+
+[Install]
+WantedBy=zfs-mount.service
+KEYEOF
+
+    systemctl daemon-reload
+    systemctl enable zfs-load-key.service &>/dev/null || true
+    if systemctl start zfs-load-key.service 2>/dev/null; then
+        echo "  ✓ zfs-load-key.service active (ordered after $unit)"
+    else
+        echo "  ⚠ zfs-load-key.service did not start — see: systemctl status zfs-load-key"
+    fi
+    echo "    Health check for a monitoring system:  systemctl is-active zfs-load-key.service"
+}
+
+# --- Encrypted dataset ------------------------------------------------------
+# Two quite different jobs behind one option: create a new encrypted dataset, or
+# adopt one that already exists and only needs to be told where its key lives
+# (the case after a reinstall onto an imported pool).
+install_zfscrypt_postreboot() {
+    local ds="$ZFSCRYPT_DATASET" keyfile="$ZFSCRYPT_KEYFILE" mode="$ZFSCRYPT_MODE"
+    local pool="${ds%%/*}"
+    local enc encroot oldloc status ds_exists=0
+
+    if ! mountpoint -q "$ZFSKEY_MOUNT"; then
+        echo "  ⚠ $ZFSKEY_MOUNT is not mounted — skipping '$ds'."
+        echo "    Creating the key here would write it to the root filesystem, which is"
+        echo "    exactly what the removable volume is meant to avoid."
+        return 0
+    fi
+    if ! zpool list "$pool" &>/dev/null; then
+        echo "  ⚠ Pool '$pool' is not imported — skipping '$ds'."
+        return 0
+    fi
+    zfs list -H -o name "$ds" &>/dev/null && ds_exists=1
+
+    # The operator stated the intent in Step 3. Where the machine disagrees with
+    # it, stop and say so rather than quietly doing the other thing: either the
+    # answer or the machine is not what was assumed, and both silent repairs
+    # ("create" onto an existing dataset, "adopt" of a missing one) are wrong.
+    case "$mode" in
+        adopt)
+            if (( ! ds_exists )); then
+                echo "  ⚠ '$ds' does not exist, but 'adopt an existing dataset' was chosen."
+                echo "    Nothing changed. Re-run postreboot and pick one of the create"
+                echo "    options, or correct the dataset name."
+                return 0
+            fi
+            ;;
+        create-existing-key|create-new-key)
+            if (( ds_exists )); then
+                echo "  ⚠ '$ds' already exists, but 'create a new dataset' was chosen."
+                echo "    Nothing changed. Re-run postreboot and pick 'adopt' to point the"
+                echo "    existing dataset at a key file, or choose a different name."
+                return 0
+            fi
+            ;;
+        *)
+            echo "  ⚠ No mode recorded for '$ds' (got '${mode:-empty}') — skipping."
+            echo "    Re-run postreboot; Step 3 asks which of the three jobs to do."
+            return 0
+            ;;
+    esac
+
+    if [[ "$mode" == "adopt" ]]; then
+        enc=$(zfs get -H -o value encryption "$ds" 2>/dev/null || echo off)
+        if [[ "$enc" == "off" ]]; then
+            echo "  ⚠ '$ds' exists and is NOT encrypted — leaving it untouched."
+            echo "    ZFS cannot encrypt a dataset after the fact. The only route is a new"
+            echo "    encrypted dataset, 'zfs send | zfs recv' into it, then swap the names."
+            return 0
+        fi
+        encroot=$(zfs get -H -o value encryptionroot "$ds")
+        if [[ "$encroot" != "$ds" ]]; then
+            echo "  ⚠ '$ds' inherits its key from '$encroot' — set the key location there."
+            return 0
+        fi
+        oldloc=$(zfs get -H -o value keylocation "$ds")
+        if [[ "$oldloc" == "file://$keyfile" ]]; then
+            echo "  ✓ '$ds' already unlocks from $keyfile"
+            return 0
+        fi
+        if [[ ! -s "$keyfile" ]]; then
+            echo "  ⚠ $keyfile is missing or empty — not touching '$ds'."
+            echo "    This dataset already has a key; a freshly generated one cannot open it."
+            echo "    Copy the original key file onto the volume first, then re-run."
+            return 0
+        fi
+        status=$(zfs get -H -o value keystatus "$ds")
+        echo "  - Pointing the key location of '$ds' at $keyfile (was: $oldloc)"
+        zfs set keylocation="file://$keyfile" "$ds"
+        if [[ "$status" == "unavailable" ]]; then
+            # Nothing is mounted from it, so trying the key costs nothing and
+            # proves the file is the right one.
+            if zfs load-key "$ds" 2>/dev/null; then
+                zfs mount "$ds" 2>/dev/null || true
+                echo "  ✓ '$ds' unlocks from $keyfile"
+            else
+                echo "  ⚠ The key in $keyfile does NOT open '$ds' — reverting to $oldloc."
+                zfs set keylocation="$oldloc" "$ds"
+            fi
+        else
+            # The key is already loaded. Verifying would mean unloading it,
+            # which unmounts live data — not something an installer should do
+            # behind the user's back.
+            echo "  ⚠ The key is currently loaded, so the new file was NOT verified."
+            echo "    A wrong file here would only surface at the next boot. Verify when"
+            echo "    the dataset is idle:  zfs unload-key $ds && zfs load-key $ds"
+        fi
+    else
+        if [[ "$mode" == "create-new-key" ]]; then
+            # Never overwrite a key file. It is not a password that can be
+            # reset: whatever it opens — this pool and every backup ever
+            # replicated from it — becomes unreadable the moment it is gone.
+            if [[ -e "$keyfile" ]]; then
+                echo "  ⚠ $keyfile already exists — refusing to overwrite it."
+                echo "    Overwriting a key file makes every dataset that uses it unreadable,"
+                echo "    backups included. Nothing changed."
+                echo "    Re-run and pick 'reuse the key file on the volume', or move the old"
+                echo "    file aside first if you are certain nothing needs it."
+                return 0
+            fi
+            echo "  - Generating a new 32-byte raw key: $keyfile"
+            ( umask 077; dd if=/dev/urandom of="$keyfile" bs=32 count=1 status=none )
+            chmod 400 "$keyfile"
+            ZFSCRYPT_KEY_IS_NEW=1
+        else
+            if [[ ! -s "$keyfile" ]]; then
+                echo "  ⚠ $keyfile is missing or empty — skipping '$ds'."
+                echo "    Put the key file on the volume, or re-run and pick 'generate a new"
+                echo "    key file'."
+                return 0
+            fi
+            echo "  - Reusing the key file already on the volume: $keyfile"
+        fi
+        zfs create -o encryption=on -o keyformat=raw \
+                   -o keylocation="file://$keyfile" "$ds"
+        echo "  ✓ Encrypted dataset '$ds' created"
+    fi
+
+    if [[ "${ZFSCRYPT_KEY_IS_NEW:-0}" -eq 1 ]]; then
+        echo ""
+        echo "  ##############################################################"
+        echo "  #  BACK UP $keyfile NOW."
+        echo "  #  It is 32 random bytes. It cannot be derived, recovered or"
+        echo "  #  reset. Lose every copy and '$ds' — including every backup"
+        echo "  #  ever replicated from it — is unreadable for good."
+        echo "  #  Put a second copy somewhere that is not this machine and"
+        echo "  #  not this volume, and write down where that is."
+        echo "  ##############################################################"
+    fi
+}
+
 # --- Unattended security upgrades -------------------------------------------
 # Safe here because the APT pre-invoke hook from the initial install snapshots
 # rpool before every dpkg run: a bad upgrade is one ZFSBootMenu rollback away.
@@ -2253,7 +2706,7 @@ UUEOF
 # yet, so fall back to the previous LTS suite rather than failing the install.
 install_tailscale_postreboot() {
     local codename suite="" c
-    codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+    codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")
     for c in "$codename" noble; do
         if curl -fsI "https://pkgs.tailscale.com/stable/ubuntu/${c}.noarmor.gpg" >/dev/null 2>&1; then
             suite="$c"
@@ -2331,6 +2784,19 @@ harden_ssh_postreboot() {
     fi
 }
 
+# Removes the drop-in again when a re-run answers "n". Without this the answer
+# would have no effect at all: the file stays and sshd keeps enforcing it.
+unharden_ssh_postreboot() {
+    rm -f /etc/ssh/sshd_config.d/10-zbm-hardening.conf
+    if /usr/sbin/sshd -t 2>/dev/null; then
+        systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+        systemctl restart ssh.socket 2>/dev/null || true
+        echo "  ✓ SSH hardening removed — sshd is back to the distribution defaults"
+    else
+        echo "  ⚠ sshd config is invalid after removing the drop-in — check /etc/ssh/sshd_config.d/"
+    fi
+}
+
 # --- Host firewall ----------------------------------------------------------
 # Split in two on purpose:
 #   install_ufw_package()  runs BEFORE fail2ban, so the "banaction = ufw" that
@@ -2344,21 +2810,26 @@ install_ufw_package() {
     echo "  ✓ ufw installed (rules and activation come at the end of this run)"
 }
 
+# Prints the port(s) sshd actually listens on, one per line, read from the
+# effective config. Hardcoding 22 would lock the admin out of a host that runs
+# sshd elsewhere — and would leave fail2ban watching a port nobody attacks.
+# Falls back to 22 when sshd -T cannot be read.
+sshd_ports() {
+    local -a ports=()
+    local _p
+    while IFS= read -r _p; do
+        [[ "$_p" =~ ^[0-9]+$ ]] && ports+=("$_p")
+    done < <(/usr/sbin/sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }' || true)
+    (( ${#ports[@]} == 0 )) && ports=(22)
+    printf '%s\n' "${ports[@]}"
+}
+
 # Ports come from the selection flags, so this works even for services that were
 # installed minutes ago. SSH is allowed before the firewall is switched on.
 enable_ufw_postreboot() {
-    # The listening port is read from the effective sshd config rather than
-    # assumed to be 22 — hardcoding it locks the admin out of a host that runs
-    # sshd anywhere else. Multiple Port lines are all honoured.
     local -a ssh_ports=()
     local _p
-    while IFS= read -r _p; do
-        [[ "$_p" =~ ^[0-9]+$ ]] && ssh_ports+=("$_p")
-    done < <(/usr/sbin/sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }' || true)
-    if (( ${#ssh_ports[@]} == 0 )); then
-        ssh_ports=(22)
-        echo "  - Could not read the sshd port (sshd -T) — falling back to 22"
-    fi
+    while IFS= read -r _p; do ssh_ports+=("$_p"); done < <(sshd_ports)
 
     # No 'ufw --force reset': a re-run must not wipe rules added by hand later.
     # Every rule below is idempotent.
@@ -2400,6 +2871,12 @@ install_fail2ban_postreboot() {
     local banaction="iptables-multiport"
     [[ "$INSTALL_UFW" == "y" ]] && banaction="ufw"
 
+    # The stock sshd jail watches port "ssh" (22). With banaction=iptables-*
+    # that silently protects nothing when sshd listens elsewhere, so the port
+    # list is taken from the live sshd config, same source as the ufw rules.
+    local ssh_portlist
+    ssh_portlist=$(sshd_ports | paste -sd, -)
+
     mkdir -p /etc/fail2ban/jail.d
     cat > /etc/fail2ban/jail.d/zbm-sshd.local << F2BEOF
 # Written by zbm-ubuntu-server-installer
@@ -2414,6 +2891,7 @@ sender    = root@$HOSTNAME
 
 [sshd]
 enabled = true
+port     = $ssh_portlist
 F2BEOF
 
     systemctl enable --now fail2ban 2>/dev/null || true
@@ -3018,16 +3496,42 @@ EOF
 
     # Write APT snapshot cleanup script and systemd units to new system before chroot
     # (written here with quoted heredocs to avoid $ escaping inside the chroot heredoc)
-    mkdir -p /mnt/usr/local/bin /mnt/etc/systemd/system
+    mkdir -p /mnt/usr/local/bin /mnt/usr/local/sbin /mnt/etc/systemd/system
+
+    # The snapshot the APT hook takes. The root dataset is looked up at run time
+    # rather than baked in: this script also ends up on systems whose boot
+    # environment is named differently (a rename, a restore, an older install),
+    # and a hardcoded name there means the hook silently snapshots nothing —
+    # the pre-upgrade rollback point would just not exist.
+    cat > /mnt/usr/local/sbin/zbm-apt-snapshot << 'EOF'
+#!/bin/sh
+# ZFS snapshot of the running root dataset, taken before every dpkg run.
+# Called from /etc/apt/apt.conf.d/80-zfs-snapshot.
+command -v zfs >/dev/null 2>&1 || exit 0
+ds=$(awk '$2 == "/" && $3 == "zfs" { print $1; exit }' /proc/self/mounts)
+[ -n "$ds" ] || exit 0
+zfs snapshot "$ds@apt-$(date +%Y-%m-%d-%H%M%S)" || true
+exit 0
+EOF
+    chmod +x /mnt/usr/local/sbin/zbm-apt-snapshot
+
     cat > /mnt/usr/local/bin/cleanup-apt-snapshots.sh << 'EOF'
 #!/bin/bash
 # Cleanup old APT ZFS snapshots — keeps at most KEEP_COUNT newest
 
 set -euo pipefail
 
-DATASET="rpool/ROOT/ubuntu-1"
+# Same lookup as /usr/local/sbin/zbm-apt-snapshot — the two must agree on which
+# dataset carries the apt- snapshots, so neither of them hardcodes a name.
+DATASET=$(awk '$2 == "/" && $3 == "zfs" { print $1; exit }' /proc/self/mounts)
 SNAPSHOT_PREFIX="apt-"
 KEEP_COUNT=10
+
+if [[ -z "$DATASET" ]]; then
+    echo "Root filesystem is not ZFS — nothing to clean up."
+    logger -t cleanup-apt-snapshots "Root filesystem is not ZFS, nothing to do"
+    exit 0
+fi
 
 snapshots=$(zfs list -H -t snapshot -o name -S creation "${DATASET}" | grep "@${SNAPSHOT_PREFIX}[0-9]" || true)
 
@@ -3095,6 +3599,11 @@ EOF
     cat > /mnt/tmp/chroot-install.sh << EOF
 #!/bin/bash
 set -euo pipefail
+
+# Nothing in this phase may open a debconf dialog: the caller already collected
+# every answer, and keyboard-configuration/console-setup/tzdata all prompt by
+# default. Without this the chroot stalls on a dialog nobody is watching.
+export DEBIAN_FRONTEND=noninteractive
 
 # Configure keyboard layout (reconfigure deferred until after packages are installed)
 cat > /etc/default/keyboard << 'KBEOF'
@@ -3177,7 +3686,7 @@ cat > /etc/sanoid/sanoid.conf << 'SANEOF'
 # Sanoid configuration for monolithic rpool
 
 [rpool/ROOT/ubuntu-1]
-    use_template = template_production
+    use_template = production
     recursive = yes
 
 #############################
@@ -3195,8 +3704,10 @@ SANEOF
 
 # APT hook: ZFS snapshot before package upgrades
 cat > /etc/apt/apt.conf.d/80-zfs-snapshot << 'HOOKEOF'
-// Take ZFS snapshot before package upgrades
-DPkg::Pre-Invoke {"if command -v zfs >/dev/null 2>&1; then zfs snapshot rpool/ROOT/ubuntu-1@apt-\$(date +%Y-%m-%d-%H%M%S) || true; fi";};
+// Take a ZFS snapshot of the root dataset before package upgrades.
+// The logic lives in the helper so the dataset name is resolved at run time and
+// this file needs no shell quoting that apt.conf would have to survive.
+DPkg::Pre-Invoke {"if [ -x /usr/local/sbin/zbm-apt-snapshot ]; then /usr/local/sbin/zbm-apt-snapshot; fi";};
 HOOKEOF
 
 # Enable Sanoid, cleanup timer, and other services
@@ -3237,13 +3748,19 @@ EOF
     mkdir -p /mnt/etc/skel/.config/zellij
     write_zellij_config /mnt/etc/skel/.config/zellij/config.kdl
     write_bash_aliases /mnt/etc/skel/.bash_aliases
-    echo "  ✓ Zellij config and bash aliases staged in /etc/skel"
+    # nano line numbers. Per-user ~/.nanorc rather than editing /etc/nanorc,
+    # which is a dpkg conffile (a local edit can hold back nano upgrades).
+    # root gets its own copy: Ubuntu's sudo sets HOME to /root.
+    echo "set linenumbers" > /mnt/etc/skel/.nanorc
+    echo "set linenumbers" > /mnt/root/.nanorc
+    echo "  ✓ Zellij config, bash aliases and .nanorc staged in /etc/skel"
 
     # Create user setup script with proper variable expansion
     # NOTE: Using unquoted EOF allows variable expansion (e.g., $USERNAME, $TIMEZONE)
     cat > /mnt/tmp/user-setup.sh << EOF
 #!/bin/bash
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
 # Create user with sudo access and standard Ubuntu groups
 useradd -m -s /bin/bash -G sudo,adm,cdrom,dip,plugdev "$USERNAME"
@@ -3284,6 +3801,7 @@ EOF
     cat > /mnt/tmp/zbm-install.sh << EOF
 #!/bin/bash
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
 # Store disk and partition variables for use in script
 DISK="$DISK"
@@ -3402,12 +3920,27 @@ echo "Using disk \$DISK partition \$PART_NUM"
 if efibootmgr -c -d "\$DISK" -p "\$PART_NUM" -L "ZFSBootMenu" -l '\EFI\ZBM\vmlinuz.EFI' 2>&1; then
     # Set ZFSBootMenu as first boot priority
     echo "Setting ZFSBootMenu as first boot priority..."
-    ZBM_BOOT_NUM=\$(efibootmgr | grep "ZFSBootMenu" | head -1 | sed 's/Boot\([0-9A-F]*\).*/\1/')
+    # efibootmgr output is captured once and then filtered from a here-string.
+    # The piped form (efibootmgr | grep | head -1) is a set -e landmine: head
+    # exits at the first line, the producer dies of SIGPIPE, and `pipefail`
+    # turns that into 141 — a failing command substitution, which aborts this
+    # whole chroot script and with it the installation. A missing "BootOrder:"
+    # line (firmware that has none yet) does the same via grep's exit 1.
+    EFI_ENTRIES=\$(efibootmgr 2>/dev/null || true)
+    ZBM_BOOT_NUM=\$(sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*ZFSBootMenu.*/\1/p' <<< "\$EFI_ENTRIES" | head -1 || true)
     if [[ -n "\$ZBM_BOOT_NUM" ]]; then
-        CURRENT_ORDER=\$(efibootmgr | grep "BootOrder:" | sed 's/BootOrder: //')
-        NEW_ORDER=\$(echo "\$CURRENT_ORDER" | sed "s/\$ZBM_BOOT_NUM,\?//g" | sed "s/^,//;s/,\$//")
-        efibootmgr -o "\$ZBM_BOOT_NUM,\$NEW_ORDER"
-        echo "  ✓ ZFSBootMenu set as first boot priority (Boot\$ZBM_BOOT_NUM)"
+        CURRENT_ORDER=\$(sed -n 's/^BootOrder: //p' <<< "\$EFI_ENTRIES" | head -1 || true)
+        if [[ -n "\$CURRENT_ORDER" ]]; then
+            NEW_ORDER=\$(sed "s/\$ZBM_BOOT_NUM,\?//g; s/^,//; s/,\$//" <<< "\$CURRENT_ORDER")
+            NEW_ORDER="\$ZBM_BOOT_NUM\${NEW_ORDER:+,\$NEW_ORDER}"
+        else
+            NEW_ORDER="\$ZBM_BOOT_NUM"
+        fi
+        if efibootmgr -o "\$NEW_ORDER" >/dev/null; then
+            echo "  ✓ ZFSBootMenu set as first boot priority (Boot\$ZBM_BOOT_NUM)"
+        else
+            echo "WARNING: Could not set BootOrder to \$NEW_ORDER — boot entry exists, order unchanged"
+        fi
     else
         echo "WARNING: Could not determine ZFSBootMenu boot entry number"
     fi
@@ -3520,6 +4053,7 @@ DATAPOOL_MOUNTPOINT="$DATAPOOL_MOUNTPOINT"
 DISK_SETUP_MODE="$DISK_SETUP_MODE"
 KEYBOARD_LAYOUT="$KEYBOARD_LAYOUT"
 KEYBOARD_VARIANT="$KEYBOARD_VARIANT"
+COMPRESSION="$COMPRESSION"
 POSTREBOOT_DONE="n"
 EOF
     chmod 600 "$INSTALL_DIR/zbm-installer.conf"
@@ -3706,6 +4240,7 @@ elif [[ "$MODE" == "postreboot" ]]; then
         # section for it.
         if zpool list "$DATAPOOL_NAME" &>/dev/null; then
             echo "  ✓ Datapool '$DATAPOOL_NAME' is already imported — skipping selection"
+            DATAPOOL_ADOPTED=1
             # The pool is complete, not half-built: mark it ready immediately so
             # a failure in the rest of this step (zfs get, conf write, sanoid.conf)
             # cannot make the ERR trap export a live pool out of zpool.cache.
@@ -3724,6 +4259,12 @@ elif [[ "$MODE" == "postreboot" ]]; then
         # DATAPOOL_NAME and DATAPOOL_MOUNTPOINT are taken from the imported pool
         # and the creation block below skips via its zpool-list check.
         elif offer_datapool_import; then
+            # An imported pool is the user's existing, complete pool — not a
+            # half-built one. Mark it ready right away so a later failure in
+            # this step cannot make the ERR trap export it out of zpool.cache
+            # (it would then no longer auto-import on the next boot).
+            DATAPOOL_READY=1
+            DATAPOOL_ADOPTED=1
             # Persist the (possibly different) pool name/mountpoint so re-runs
             # of postreboot find the imported pool instead of trying to create
             persist_conf_var DATAPOOL_NAME "$DATAPOOL_NAME"
@@ -3751,6 +4292,9 @@ elif [[ "$MODE" == "postreboot" ]]; then
         # utf8only=on, which would reject filenames that Samba/NFS clients are
         # allowed to create. These are creation-time defaults only — an existing
         # pool that gets imported is left exactly as the user made it.
+        # COMPRESSION comes from zbm-installer.conf (written by the initial
+        # phase); before it was persisted there, a datapool always ended up with
+        # the script default lz4 even when the user had chosen zstd or gzip.
         DATAPOOL_PROPS=(
             -o autotrim=on
             -O compression="${COMPRESSION}"
@@ -3796,6 +4340,10 @@ elif [[ "$MODE" == "postreboot" ]]; then
                 fi
                 DISK_DATAPOOL_ID=$(resolve_part_byid "$DATAPOOL_PARTITION")
                 echo "  - Using partition: $DISK_DATAPOOL_ID"
+                # `zpool create -f` overwrites any label it finds. Partition 4 is
+                # normally virgin, but a re-run after the pool was exported (or
+                # renamed in the conf) would otherwise destroy it without asking.
+                confirm_labelclear "$DISK_DATAPOOL_ID"
                 zpool create -f -o ashift=$ASHIFT \
                              "${DATAPOOL_PROPS[@]}" \
                              -O mountpoint="$DATAPOOL_MOUNTPOINT" \
@@ -3830,13 +4378,42 @@ elif [[ "$MODE" == "postreboot" ]]; then
         echo ""
         if ! grep -q "^\[$DATAPOOL_NAME\]" /etc/sanoid/sanoid.conf; then
             echo "  - Adding datapool to Sanoid configuration..."
+            # An adopted pool arrives with a snapshot history this install did
+            # not create and knows nothing about — very likely under a longer
+            # retention than the template below. Sanoid's very first run would
+            # otherwise autoprune the difference away, irreversibly, on the
+            # user's production data. Write the section with pruning OFF and say
+            # so: taking snapshots is safe, deleting them is not.
+            _prune_line=""
+            _existing_snaps=0
+            if [[ "${DATAPOOL_ADOPTED:-0}" -eq 1 ]]; then
+                _existing_snaps=$(zfs list -H -t snapshot -o name -r "$DATAPOOL_NAME" 2>/dev/null | wc -l)
+            fi
+            if (( _existing_snaps > 0 )); then
+                _prune_line="    # This pool was adopted with $_existing_snaps existing snapshot(s).
+    # Pruning is off so this install cannot delete history it did not create.
+    # Review the retention in [template_production] above, then set autoprune = yes.
+    autoprune = no"
+            fi
             cat >> /etc/sanoid/sanoid.conf << EOF
 
 [$DATAPOOL_NAME]
-    use_template = template_production
+    use_template = production
     recursive = yes
+$_prune_line
 EOF
-            echo "  ✓ Sanoid configured for $DATAPOOL_NAME"
+            if (( _existing_snaps > 0 )); then
+                echo "  ✓ Sanoid configured for $DATAPOOL_NAME — snapshots ON, pruning OFF"
+                echo ""
+                echo "  ⚠ '$DATAPOOL_NAME' was adopted with $_existing_snaps existing snapshot(s)."
+                echo "    The retention written here is probably shorter than the one they were"
+                echo "    kept under, and autoprune would delete the difference on the very first"
+                echo "    Sanoid run. It is therefore switched off for this pool."
+                echo "    Set the retention you want in /etc/sanoid/sanoid.conf, then remove the"
+                echo "    'autoprune = no' line from the [$DATAPOOL_NAME] section."
+            else
+                echo "  ✓ Sanoid configured for $DATAPOOL_NAME"
+            fi
         else
             echo "  ✓ Sanoid already configured for $DATAPOOL_NAME, skipping"
         fi
@@ -3852,10 +4429,24 @@ EOF
     echo "Step 3: Optional software selection..."
     prompt_postreboot_software
 
+    # Key volume and encrypted dataset come before anything that might want to
+    # write into that dataset, and while the pool work of Step 2 is still fresh.
+    if [[ "$INSTALL_ZFSKEY" == "y" ]]; then
+        echo ""
+        echo "Step 4: Setting up the ZFS key volume '$ZFSKEY_LABEL'..."
+        install_zfskey_postreboot
+    fi
+
+    if [[ "$INSTALL_ZFSCRYPT" == "y" ]]; then
+        echo ""
+        echo "Step 5: Setting up encrypted dataset '$ZFSCRYPT_DATASET'..."
+        install_zfscrypt_postreboot
+    fi
+
     # STORAGE_POOL/STORAGE_BASE were chosen during the question phase above
     if [[ "$INSTALL_DOCKER" == "y" || "$INSTALL_VIRT" == "y" ]]; then
         echo ""
-        echo "Step 4: Creating software datasets on $STORAGE_POOL..."
+        echo "Step 6: Creating software datasets on $STORAGE_POOL..."
         create_software_datasets "$STORAGE_POOL" "$STORAGE_BASE"
 
         # User-writable data areas; dockerroot and VM image storage stay
@@ -3873,19 +4464,19 @@ EOF
 
     if [[ "$INSTALL_DOCKER" == "y" ]]; then
         echo ""
-        echo "Step 5: Installing Docker Engine..."
+        echo "Step 7: Installing Docker Engine..."
         install_docker_postreboot
     fi
 
     if [[ "$INSTALL_VIRT" == "y" ]]; then
         echo ""
-        echo "Step 6: Installing KVM/libvirt virtualization..."
+        echo "Step 8: Installing KVM/libvirt virtualization..."
         install_virtualization_postreboot
     fi
 
     if [[ "$INSTALL_PODMAN" == "y" ]]; then
         echo ""
-        echo "Step 7: Installing Podman..."
+        echo "Step 9: Installing Podman..."
         install_podman_postreboot
     fi
 
@@ -3893,67 +4484,67 @@ EOF
     # their alerts to /usr/sbin/sendmail, which only exists once msmtp-mta is in
     if [[ "$INSTALL_MTA" == "y" ]]; then
         echo ""
-        echo "Step 8: Configuring mail relay (msmtp)..."
+        echo "Step 10: Configuring mail relay (msmtp)..."
         install_mta_postreboot
     fi
 
     if [[ "$INSTALL_HEALTH" == "y" ]]; then
         echo ""
-        echo "Step 9: Setting up disk and pool health monitoring..."
+        echo "Step 11: Setting up disk and pool health monitoring..."
         install_health_postreboot
     fi
 
     if [[ "$INSTALL_UNATTENDED" == "y" ]]; then
         echo ""
-        echo "Step 10: Enabling unattended security upgrades..."
+        echo "Step 12: Enabling unattended security upgrades..."
         install_unattended_upgrades_postreboot
     fi
 
     if [[ "$INSTALL_TAILSCALE" == "y" ]]; then
         echo ""
-        echo "Step 11: Installing Tailscale..."
+        echo "Step 13: Installing Tailscale..."
         install_tailscale_postreboot
     fi
 
     if [[ "$INSTALL_COCKPIT" == "y" ]]; then
         echo ""
-        echo "Step 12: Installing Cockpit..."
+        echo "Step 14: Installing Cockpit..."
         install_cockpit_postreboot
     fi
 
     if [[ "$INSTALL_SAMBA" == "y" ]]; then
         echo ""
-        echo "Step 13: Installing Samba..."
+        echo "Step 15: Installing Samba..."
         install_samba_postreboot
     fi
 
     if [[ "$INSTALL_NFS" == "y" ]]; then
         echo ""
-        echo "Step 14: Installing NFS server..."
+        echo "Step 16: Installing NFS server..."
         install_nfs_postreboot
     fi
 
     if [[ "$INSTALL_NODEEXP" == "y" ]]; then
         echo ""
-        echo "Step 15: Installing prometheus-node-exporter..."
+        echo "Step 17: Installing prometheus-node-exporter..."
         install_nodeexp_postreboot
     fi
 
     if [[ "$INSTALL_NETDATA" == "y" ]]; then
         echo ""
-        echo "Step 16: Installing netdata..."
+        echo "Step 18: Installing netdata..."
         install_netdata_postreboot
     fi
 
     if [[ "$INSTALL_NUT" == "y" ]]; then
         echo ""
-        echo "Step 17: Installing UPS monitoring (NUT)..."
+        echo "Step 19: Installing UPS monitoring (NUT)..."
         install_nut_postreboot
     fi
 
     if [[ "$INSTALL_TOOLBELT" == "y" ]]; then
         echo ""
-        echo "Step 18: Installing shell toolbelt..."
+        echo "Step 20: Installing shell toolbelt..."
         install_toolbelt_postreboot
     fi
 
@@ -3963,32 +4554,39 @@ EOF
     # end so its rule set matches the services this run actually installed.
     if [[ "$HARDEN_SSH" == "y" ]]; then
         echo ""
-        echo "Step 19: Hardening SSH..."
+        echo "Step 21: Hardening SSH..."
         harden_ssh_postreboot
+    elif [[ -f /etc/ssh/sshd_config.d/10-zbm-hardening.conf ]]; then
+        # The question defaults to "y" whenever the drop-in exists, so getting
+        # here means the user explicitly asked for it to go. Leaving the file
+        # behind would make the answer a no-op.
+        echo ""
+        echo "Step 21: Removing the SSH hardening drop-in (answered 'n')..."
+        unharden_ssh_postreboot
     fi
 
     if [[ "$INSTALL_UFW" == "y" ]]; then
         echo ""
-        echo "Step 20: Installing ufw..."
+        echo "Step 22: Installing ufw..."
         install_ufw_package
     fi
 
     if [[ "$INSTALL_FAIL2BAN" == "y" ]]; then
         echo ""
-        echo "Step 21: Installing fail2ban..."
+        echo "Step 23: Installing fail2ban..."
         install_fail2ban_postreboot
     fi
 
     if [[ "$INSTALL_UFW" == "y" ]]; then
         echo ""
-        echo "Step 22: Enabling the ufw host firewall..."
+        echo "Step 24: Enabling the ufw host firewall..."
         enable_ufw_postreboot
     fi
 
     # Written only after everything above succeeded, so a failed run keeps
     # mode auto-detection pointing at postreboot for a re-run
     echo ""
-    echo "Step 23: Recording postreboot completion..."
+    echo "Step 25: Recording postreboot completion..."
     persist_postreboot_selection
     if grep -q '^POSTREBOOT_DONE=' "$INSTALL_CONF"; then
         sed -i 's/^POSTREBOOT_DONE=.*/POSTREBOOT_DONE="y"/' "$INSTALL_CONF"
@@ -4012,6 +4610,10 @@ EOF
     fi
     echo "  - Sanoid configured for hourly/daily/monthly snapshots"
     echo "  - APT hook creates snapshots before updates (keeps last 10, cleaned weekly)"
+    if [[ "${DATAPOOL_ADOPTED:-0}" -eq 1 ]]; then
+        echo "  ⚠ '$DATAPOOL_NAME' was adopted, not created — check its retention and the"
+        echo "    'autoprune' setting in /etc/sanoid/sanoid.conf before the first Sanoid run"
+    fi
     echo "  - ZFSBootMenu installed and configured"
     echo ""
     echo "Next steps:"
@@ -4034,6 +4636,20 @@ EOF
     if [[ "$INSTALL_HEALTH" == "y" ]]; then
         echo "  - Health monitoring: smartd + ZED alerts → $ADMIN_EMAIL, monthly scrub timers"
         echo "    Check with: smartctl -a /dev/<disk> | systemctl list-timers 'zfs-scrub*'"
+    fi
+    if [[ "$INSTALL_ZFSKEY" == "y" ]]; then
+        echo "  - ZFS key volume '$ZFSKEY_LABEL' → $ZFSKEY_MOUNT (fstab, by-label, nofail)"
+        echo "    Keys are loaded by zfs-load-key.service before zfs-mount.service."
+        echo "    Watch it: systemctl is-active zfs-load-key.service — it fails when the"
+        echo "    volume is absent, which is the only signal that the data stayed locked."
+    fi
+    if [[ "$INSTALL_ZFSCRYPT" == "y" ]]; then
+        echo "  - Encrypted dataset: $ZFSCRYPT_DATASET, key file $ZFSCRYPT_KEYFILE"
+        echo "    Verify after a reboot: zfs get keystatus,mounted $ZFSCRYPT_DATASET"
+        if [[ "${ZFSCRYPT_KEY_IS_NEW:-0}" -eq 1 ]]; then
+            echo "    ⚠ The key was generated by this run and exists in ONE place."
+            echo "      Copy it off this machine before you put anything in the dataset."
+        fi
     fi
     if [[ "$INSTALL_MTA" == "y" ]]; then
         echo "  - Mail relay: $SMTP_HOST:$SMTP_PORT (credentials in /etc/msmtprc, mode 600)"
