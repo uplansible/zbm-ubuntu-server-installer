@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.59
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.60
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -1217,8 +1217,8 @@ keybinds clear-defaults=true {
         bind "Alt f" { ToggleFloatingPanes; }
         bind "Alt ," { MoveTab "left"; }
         bind "Alt ." { MoveTab "right"; }
-        bind "Alt u" { GoToPreviousTab; }
-        bind "Alt i" { GoToNextTab; }
+        bind "Ctrl Shift left" { GoToPreviousTab; }
+        bind "Ctrl Shift right" { GoToNextTab; }
         bind "Alt j" { MoveFocus "down"; }
         bind "Alt k" { MoveFocus "up"; }
         bind "Alt l" { MoveFocusOrTab "right"; }
