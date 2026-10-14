@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.57
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.58
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -1203,6 +1203,15 @@ keybinds clear-defaults=true {
             }
             SwitchToMode "normal"
         }
+        bind "x" {
+            // Kill every session except this one, then delete exited
+            // (resurrectable) sessions. No confirmation prompt.
+            Run "bash" "-c" "zellij list-sessions --short | grep -vxF \"$ZELLIJ_SESSION_NAME\" | xargs -r -n1 zellij kill-session; zellij delete-all-sessions --yes" {
+                floating true
+                close_on_exit true
+            }
+            SwitchToMode "normal"
+        }
     }
     shared {
         bind "Alt left" { MoveFocusOrTab "left"; }
@@ -1215,7 +1224,10 @@ keybinds clear-defaults=true {
         bind "Alt [" { PreviousSwapLayout; }
         bind "Alt ]" { NextSwapLayout; }
         bind "Alt f" { ToggleFloatingPanes; }
-        bind "Alt i" { MoveTab "left"; }
+        bind "Alt ," { MoveTab "left"; }
+        bind "Alt ." { MoveTab "right"; }
+        bind "Alt u" { GoToPreviousTab; }
+        bind "Alt i" { GoToNextTab; }
         bind "Alt j" { MoveFocus "down"; }
         bind "Alt k" { MoveFocus "up"; }
         bind "Alt l" { MoveFocusOrTab "right"; }
@@ -1229,6 +1241,7 @@ keybinds clear-defaults=true {
     shared_except "locked" "entersearch" "renametab" "renamepane" "prompt" "tmux" {
         bind "Alt g" { SwitchToMode "locked"; }
         bind "Alt q" { Quit; }
+        bind "Alt w" { NewTab; SwitchToMode "renametab"; TabNameInput 0; }
     }
     shared_except "locked" "entersearch" "renametab" "renamepane" "session" "prompt" "tmux" {
         bind "Alt o" { SwitchToMode "session"; }
@@ -1251,7 +1264,6 @@ keybinds clear-defaults=true {
     shared_among "locked" "entersearch" "renametab" "renamepane" "prompt" "tmux" {
         bind "Alt h" { MoveFocusOrTab "left"; }
         bind "Alt n" { NewPane; }
-        bind "Alt o" { MoveTab "right"; }
     }
     shared_except "normal" "locked" "entersearch" {
         bind "enter" { SwitchToMode "normal"; }
