@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ################################################################################
-# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.58
+# Ubuntu Server 26.04 ZFSBootMenu Installation Script v3.0.59
 # - Monolithic rpool structure (single dataset for easy rollback)
 # - Partition-based layout (not whole disk)
 # - Sanoid for snapshot management
@@ -1200,15 +1200,6 @@ keybinds clear-defaults=true {
             LaunchOrFocusPlugin "session-manager" {
                 floating true
                 move_to_focused_tab true
-            }
-            SwitchToMode "normal"
-        }
-        bind "x" {
-            // Kill every session except this one, then delete exited
-            // (resurrectable) sessions. No confirmation prompt.
-            Run "bash" "-c" "zellij list-sessions --short | grep -vxF \"$ZELLIJ_SESSION_NAME\" | xargs -r -n1 zellij kill-session; zellij delete-all-sessions --yes" {
-                floating true
-                close_on_exit true
             }
             SwitchToMode "normal"
         }
